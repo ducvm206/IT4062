@@ -185,10 +185,45 @@ int load_shared_files() {
 }
 
 // =============================================================================
+// SERVER CONNECTION FUNCTIONS
+// =============================================================================
+// Connect to server
+SOCKET connect_to_server(const char *server_ip, int server_port) {
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        printf("[ERROR] Cannot create socket: %d\n", WSAGetLastError());
+        return INVALID_SOCKET;
+    }
+    
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
+    
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+        printf("[ERROR] Cannot connect to server %s:%d - %d\n", server_ip, server_port, WSAGetLastError());
+        closesocket(sock);
+        return INVALID_SOCKET;
+    }
+    
+    printf("[INFO] Connected to server %s:%d successfully\n", server_ip, server_port);
+    return sock;
+}
+
+// Disconnect from server
+void disconnect_from_server(SOCKET sock) {
+    if (sock != INVALID_SOCKET) {
+        closesocket(sock);
+        printf("[INFO] Disconnected from server\n");
+    }
+}
+
+// =============================================================================
 // SOCKET I/O FUNCTIONS
 // =============================================================================
 
-// Send message to server
+// Send message to server (Example: "LOGIN username password\r\n")
 // Returns: number of bytes sent, or -1 on error
 int send_message(SOCKET sock, const char *message) {
     int len = strlen(message);
