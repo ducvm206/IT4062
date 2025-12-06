@@ -191,8 +191,8 @@ void process_request(Session *session, char *request) {
         printf("[INFO] User logged in: %s\n", username);
     }
 
-    // Handle GETINFO command
-    else if (strcmp(command, "GETINFO") == 0) {
+    // Handle SENDINFO command
+    else if (strcmp(command, "SENDINFO") == 0) {
         // Check if logged in
         if (!session->is_logged_in) {
             send_response(session->socket_fd, "403\r\n");
@@ -202,7 +202,7 @@ void process_request(Session *session, char *request) {
         uint32_t client_id;
         int port;
         
-        // Parse arguments: GETINFO <ClientID> <Port>
+        // Parse arguments: SENDINFO <ClientID> <Port>
         if (sscanf(argument, "%u %d", &client_id, &port) != 2) {
             send_response(session->socket_fd, "300\r\n");
             return;
@@ -413,6 +413,5 @@ void process_request(Session *session, char *request) {
     }
 }
 
-// HANDLE REGISTERING
 
 

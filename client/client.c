@@ -185,6 +185,112 @@ int load_shared_files() {
 }
 
 // =============================================================================
+// SENDINFO PROTOCOL IMPLEMENTATION
+// =============================================================================
+
+// Send client info to server
+// params: sock - connected server socket
+//         client_id - 32-bit ClientID
+//         p2p_port - P2P listening port
+// returns: 0 on success, -1 on error
+int send_client_info(SOCKET sock, uint32_t client_id, int p2p_port) {
+    char message[256];
+    char response[BUFF_SIZE];
+    
+    // Validate parameters
+    if (sock == INVALID_SOCKET) {
+        printf("[ERROR] Invalid socket\n");
+        return -1;
+    }
+    
+    if (p2p_port <= 0 || p2p_port > 65535) {
+        printf("[ERROR] Invalid port number: %d\n", p2p_port);
+        return -1;
+    }
+    
+    // Build SENDINFO message: "SENDINFO <ClientID> <P2PPort>\r\n"
+    snprintf(message, sizeof(message), "SENDINFO %u %d\r\n", client_id, p2p_port);
+    
+    printf("[INFO] Sending client info to server...\n");
+    printf("[DEBUG] Message: %s", message);
+    
+    // Send message to server
+    if (send_message(sock, message) < 0) {
+        printf("[ERROR] Failed to send SENDINFO message\n");
+        return -1;
+    }
+    
+    // Receive response from server
+    int received = receive_response(sock, response, sizeof(response));
+    if (received <= 0) {
+        printf("[ERROR] Failed to receive response from server\n");
+        return -1;
+    }
+    
+    // Print server response
+    print_response_message(response);
+    
+    // Check if operation was successful (response code 103)
+    if (strncmp(response, "103", 3) == 0) {
+        printf("[INFO] Client info registered on server successfully\n");
+        printf("[INFO] ClientID: %u, P2P Port: %d\n", client_id, p2p_port);
+        return 0;
+    } else {
+        printf("[ERROR] Server rejected client info\n");
+        return -1;
+    }
+}
+
+// Automatically send client info after login
+// returns: 0 on success, -1 on error
+int auto_send_client_info() {
+    // Check if client is logged in
+    if (!g_client.is_logged_in) {
+        printf("[ERROR] Must login before sending client info\n");
+        return -1;
+    }
+    
+    // Check if server socket is valid
+    if (g_client.server_socket == INVALID_SOCKET) {
+        printf("[ERROR] Not connected to server\n");
+        return -1;
+    }
+    
+    // Send client info
+    return send_client_info(g_client.server_socket, 
+                           g_client.client_id, 
+                           g_client.p2p_port);
+}
+
+// Update P2P port and notify server
+// params: new_port - new P2P port number
+// returns: 0 on success, -1 on error
+int update_client_port(int new_port) {
+    if (new_port <= 0 || new_port > 65535) {
+        printf("[ERROR] Invalid port number\n");
+        return -1;
+    }
+    
+    // Update local state
+    int old_port = g_client.p2p_port;
+    g_client.p2p_port = new_port;
+    
+    // Send updated info to server
+    if (send_client_info(g_client.server_socket, 
+                        g_client.client_id, 
+                        g_client.p2p_port) == 0) {
+        printf("[INFO] Port updated from %d to %d\n", old_port, new_port);
+        return 0;
+    } else {
+        // Revert on failure
+        g_client.p2p_port = old_port;
+        printf("[ERROR] Failed to update port on server\n");
+        return -1;
+    }
+}
+
+
+// =============================================================================
 // SERVER CONNECTION FUNCTIONS
 // =============================================================================
 // Connect to server
