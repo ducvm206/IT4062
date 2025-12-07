@@ -143,8 +143,9 @@ void print_response_message(const char *response) {
 // =============================================================================
 
 // Initialize client state
+// Sets default values for client state variables
 void init_client_state() {
-    memset(&g_client, 0, sizeof(ClientState));
+    memset(&g_client, 0, sizeof(ClientState));          
     g_client.p2p_port = P2P_PORT;
     g_client.server_socket = INVALID_SOCKET;
     g_client.p2p_socket = INVALID_SOCKET;
@@ -154,15 +155,18 @@ void init_client_state() {
 
 // Load shared files from index.txt
 int load_shared_files() {
+    // Open index.txt for reading
     FILE *fp = fopen("index.txt", "r");
     if (!fp) {
         printf("[INFO] index.txt not found, no files to share\n");
         return 0;
     }
     
+    // Initialize shared files list
     g_shared_files.count = 0;
     char line[768];
-    
+
+    // Read each line and parse file info
     while (fgets(line, sizeof(line), fp) && g_shared_files.count < MAX_SHARED_FILES) {
         // Remove newline
         line[strcspn(line, "\r\n")] = 0;
@@ -178,7 +182,8 @@ int load_shared_files() {
             }
         }
     }
-    
+
+    // Close the file after reading
     fclose(fp);
     printf("[INFO] Loaded %d shared files from index.txt\n", g_shared_files.count);
     return g_shared_files.count;
@@ -194,6 +199,7 @@ int load_shared_files() {
 //         p2p_port - P2P listening port
 // returns: 0 on success, -1 on error
 int send_client_info(SOCKET sock, uint32_t client_id, int p2p_port) {
+    // Build SENDINFO message
     char message[256];
     char response[BUFF_SIZE];
     
@@ -203,6 +209,7 @@ int send_client_info(SOCKET sock, uint32_t client_id, int p2p_port) {
         return -1;
     }
     
+    // If port is outside valid range
     if (p2p_port <= 0 || p2p_port > 65535) {
         printf("[ERROR] Invalid port number: %d\n", p2p_port);
         return -1;
@@ -211,6 +218,7 @@ int send_client_info(SOCKET sock, uint32_t client_id, int p2p_port) {
     // Build SENDINFO message: "SENDINFO <ClientID> <P2PPort>\r\n"
     snprintf(message, sizeof(message), "SENDINFO %u %d\r\n", client_id, p2p_port);
     
+    // Log sending info
     printf("[INFO] Sending client info to server...\n");
     printf("[DEBUG] Message: %s", message);
     
@@ -293,6 +301,7 @@ int update_client_port(int new_port) {
 // =============================================================================
 // SERVER CONNECTION FUNCTIONS
 // =============================================================================
+
 // Connect to server
 SOCKET connect_to_server(const char *server_ip, int server_port) {
     // Create socket
@@ -337,6 +346,7 @@ void disconnect_from_server(SOCKET sock) {
 // Send message to server (Example: "LOGIN username password\r\n")
 // Returns: number of bytes sent, or -1 on error
 int send_message(SOCKET sock, const char *message) {
+    // len = length of the message; total_sent = total bytes sent so far
     int len = strlen(message);
     int total_sent = 0;
     
