@@ -295,18 +295,23 @@ int update_client_port(int new_port) {
 // =============================================================================
 // Connect to server
 SOCKET connect_to_server(const char *server_ip, int server_port) {
+    // Create socket
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    // Validate socket
     if (sock == INVALID_SOCKET) {
         printf("[ERROR] Cannot create socket: %d\n", WSAGetLastError());
         return INVALID_SOCKET;
     }
-    
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(server_port);
-    inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
-    
+
+    // Setup server address structure
+    struct sockaddr_in server_addr;                             // Server address structure
+    memset(&server_addr, 0, sizeof(server_addr));                // Clear structure 
+    server_addr.sin_family = AF_INET;                       // IPv4
+    server_addr.sin_port = htons(server_port);           // Server port
+    inet_pton(AF_INET, server_ip, &server_addr.sin_addr);        // Server IP
+
+
+    // Connect to server
     if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
         printf("[ERROR] Cannot connect to server %s:%d - %d\n", server_ip, server_port, WSAGetLastError());
         closesocket(sock);
@@ -430,6 +435,8 @@ int receive_full_response(SOCKET sock, char *buffer, int buffer_size) {
 int main(int argc, char *argv[]) {
     // Initialize Winsock
     WSADATA wsa;
+
+    // Start Winsock, returns 1 if error
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
         printf("[ERROR] WSAStartup failed: %d\n", WSAGetLastError());
         return 1;
@@ -459,13 +466,6 @@ int main(int argc, char *argv[]) {
     printf("[INFO] Client ID: %u\n", g_client.client_id);
     printf("[INFO] P2P Port: %d\n", g_client.p2p_port);
     printf("[INFO] Shared files: %d\n", g_shared_files.count);
-    
-    // TODO: Connect to server
-    // TODO: Login/Register
-    // TODO: Send GETINFO
-    // TODO: Publish files
-    // TODO: Handle user commands
-    
     WSACleanup();
     return 0;
 }
