@@ -13,6 +13,10 @@
 // Windows threading + sleep
 #include <windows.h>
 
+// Database libraries
+#include <sqlite3.h>
+#include <openssl/sha.h>   // For hashing passwords
+
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -28,74 +32,92 @@
 // STRUCTURES AND TYPE DEFINITIONS
 // =============================================================================
 
-// Structure for account information
-typedef struct {
-    char username[64];
-    char password[64];
-} Account;
-
 // Structure for session information
 typedef struct {
-    int socket_fd;                     // Socket FD of client
-    struct sockaddr_in client_addr;    // Connection address
-    int account_id;                    // User ID (mapped from Account list), -1 if not logged in
-    char username[64];                 // Username after login
-    int is_active;                     // Is connected?
-    int is_logged_in;                  // Is logged in?
-    time_t last_active;                // For timeout / alive check
+    SOCKET socket_fd;
+    struct sockaddr_in client_addr;
+
+    int account_id;          // FK → accounts.account_id
+    uint32_t client_id;      // ClientID sent via SENDINFO
+
+    int is_logged_in;
+    int is_active;
+    time_t last_active;
 } Session;
 
 // Information about a client's P2P connection details
 typedef struct {
-    uint32_t client_id;              // Client's unique ID
-    char ip_address[16];             // Client's IP
-    int p2p_port;                    // Client's P2P port
-    int session_index;               // Index in sessions array
-    int is_active;                   // Is this connection active?
+    uint32_t client_id;
+    char ip_address[16];
+    int p2p_port;
+    Session *session;
 } ClientConnection;
 
 // Server's file index entry
 typedef struct {
-    char filename[256];              // File name
-    uint32_t client_id;              // Owner ClientID
-    char ip_address[16];             // Owner IP
-    int port;                        // Owner P2P port
-    uint64_t filesize;               // File size (optional)
-    time_t published_time;           // When file was published
-    int is_active;                   // Is file still available?
+    int file_id;           // DB primary key
+    char filename[256];
+
+    uint32_t client_id;
+    char ip_address[16];
+    int port;
+
+    uint64_t filesize;
+    time_t published_time;
 } FileIndexEntry;
 
 // =============================================================================
 // GLOBAL VARIABLES
 // =============================================================================
 
-// Account management
-Account accounts[MAX_CLIENTS];
-int account_count = 0;
-pthread_mutex_t account_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// Session management
+// Session management (runtime only)
 Session sessions[MAX_CLIENTS];
 int session_count = 0;
 pthread_mutex_t session_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Client connection management (for GETINFO mapping)
+// Client connection mapping (runtime only)
 ClientConnection client_connections[MAX_CLIENTS];
 int connection_count = 0;
 pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// File index management
-FileIndexEntry file_index[MAX_TOTAL_FILES];
-int file_index_count = 0;
-pthread_mutex_t file_index_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Database handle
+sqlite3 *g_db = NULL;
 
 // =============================================================================
 // MESSAGE HANDLING FUNCTIONS
 // =============================================================================
 
+// Send all data in buffer
+// returns: 0 on success, -1 on error
+// Parameters: socket_fd - socket file descriptor
+//             buffer - data buffer to send
+//             length - length of data to send
+int send_all(SOCKET socket_fd, const char *buffer, int length) {
+    int total_sent = 0;     // Total bytes sent
+    int bytes_left = length;
+    int sent;
+
+    // Keep sending until all data is sent
+    while (total_sent < length) {
+        sent = send(socket_fd,
+                    buffer + total_sent,
+                    bytes_left,
+                    0);
+
+        if (sent == SOCKET_ERROR) {
+            return -1;
+        }
+
+        total_sent += sent;
+        bytes_left -= sent;
+    }
+
+    return 0;
+}
+
 // Send response to client
-void send_response(int socket_fd, const char *response) {
-    send(socket_fd, response, strlen(response), 0);
+void send_response(SOCKET socket_fd, const char *response) {
+    send_all(socket_fd, response, (int)strlen(response));
 }
 
 void process_request(Session *session, char *request) {
@@ -105,6 +127,7 @@ void process_request(Session *session, char *request) {
         request[len-2] = '\0';
     }
 
+    // Parse command and arguments
     char command[20];
     char argument[BUFF_SIZE];
     memset(argument, 0, sizeof(argument));
@@ -117,300 +140,329 @@ void process_request(Session *session, char *request) {
 
     // Handle REGISTER command
     if (strcmp(command, "REGISTER") == 0) {
-        char username[64], password[64];
-        
-        // Parse arguments
-        if (sscanf(argument, "%s %s", username, password) != 2) {
+        char username[64], password[64], password_hash[65];
+
+        if (sscanf(argument, "%63s %63s", username, password) != 2) {
             send_response(session->socket_fd, "300\r\n");
             return;
         }
-        
-        // Check password length (minimum 6 characters)
+
         if (strlen(password) < 6) {
             send_response(session->socket_fd, "400\r\n");
             return;
         }
-        
-        // Check if username already exists
-        pthread_mutex_lock(&account_mutex);
-        for (int i = 0; i < account_count; i++) {
-            if (strcmp(accounts[i].username, username) == 0) {
-                pthread_mutex_unlock(&account_mutex);
-                send_response(session->socket_fd, "400\r\n");
-                return;
-            }
+
+        sha256(password, password_hash);
+
+        sqlite3_stmt *stmt;
+        const char *sql =
+            "INSERT INTO accounts (username, password_hash) VALUES (?, ?);";
+
+        if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            send_response(session->socket_fd, "400\r\n");
+            return;
         }
-        
-        // Register successful
-        strcpy(accounts[account_count].username, username);
-        strcpy(accounts[account_count].password, password);
-        account_count++;
-        pthread_mutex_unlock(&account_mutex);
-        
+
+        sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, password_hash, -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
+            send_response(session->socket_fd, "400\r\n");
+            return;
+        }
+
+        sqlite3_finalize(stmt);
         send_response(session->socket_fd, "101\r\n");
-        printf("[INFO] User registered: %s\n", username);
     }
 
     // Handle LOGIN command
     else if (strcmp(command, "LOGIN") == 0) {
-        char username[64], password[64];
-        
-        // Parse arguments
-        if (sscanf(argument, "%s %s", username, password) != 2) {
+        char username[64], password[64], password_hash[65];
+
+        if (sscanf(argument, "%63s %63s", username, password) != 2) {
             send_response(session->socket_fd, "300\r\n");
             return;
         }
-        
-        // Check if username and password match
-        pthread_mutex_lock(&account_mutex);
-        int found = 0;
-        int account_id = -1;
-        for (int i = 0; i < account_count; i++) {
-            if (strcmp(accounts[i].username, username) == 0 &&
-                strcmp(accounts[i].password, password) == 0) {
-                found = 1;
-                account_id = i;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&account_mutex);
-        
-        if (!found) {
+
+        sha256(password, password_hash);
+
+        sqlite3_stmt *stmt;
+        const char *sql =
+            "SELECT account_id FROM accounts WHERE username=? AND password_hash=?;";
+
+        sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL);
+        sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, password_hash, -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            session->account_id = sqlite3_column_int(stmt, 0);
+            session->is_logged_in = 1;
+            send_response(session->socket_fd, "102\r\n");
+        } else {
             send_response(session->socket_fd, "401\r\n");
-            return;
         }
-        
-        // Login successful
-        pthread_mutex_lock(&session_mutex);
-        session->is_logged_in = 1;
-        session->account_id = account_id;
-        strcpy(session->username, username);
-        pthread_mutex_unlock(&session_mutex);
-        
-        send_response(session->socket_fd, "102\r\n");
-        printf("[INFO] User logged in: %s\n", username);
+
+        sqlite3_finalize(stmt);
     }
 
     // Handle SENDINFO command
     else if (strcmp(command, "SENDINFO") == 0) {
-        // Check if logged in
         if (!session->is_logged_in) {
             send_response(session->socket_fd, "403\r\n");
             return;
         }
-        
+
         uint32_t client_id;
         int port;
-        
-        // Parse arguments: SENDINFO <ClientID> <Port>
-        if (sscanf(argument, "%u %d", &client_id, &port) != 2) {
-            send_response(session->socket_fd, "300\r\n");
-            return;
-        }
-        
-        // Get client IP from session
-        char client_ip[16];
-        inet_ntop(AF_INET, &(session->client_addr.sin_addr), client_ip, sizeof(client_ip));
-        
-        // Store or update client connection info
-        pthread_mutex_lock(&connection_mutex);
-        
-        int found = 0;
-        for (int i = 0; i < connection_count; i++) {
-            if (client_connections[i].client_id == client_id) {
-                // Update existing connection
-                strcpy(client_connections[i].ip_address, client_ip);
-                client_connections[i].p2p_port = port;
-                client_connections[i].is_active = 1;
-                found = 1;
-                break;
-            }
-        }
-        
-        if (!found && connection_count < MAX_CLIENTS) {
-            // Add new connection
-            client_connections[connection_count].client_id = client_id;
-            strcpy(client_connections[connection_count].ip_address, client_ip);
-            client_connections[connection_count].p2p_port = port;
-            client_connections[connection_count].session_index = session - sessions;
-            client_connections[connection_count].is_active = 1;
-            connection_count++;
-        }
-        
-        pthread_mutex_unlock(&connection_mutex);
-        
+        char ip[16];
+
+        sscanf(argument, "%u %d", &client_id, &port);
+        inet_ntop(AF_INET, &session->client_addr.sin_addr, ip, sizeof(ip));
+
+        session->client_id = client_id;
+
+        sqlite3_stmt *stmt;
+        const char *sql =
+            "INSERT OR REPLACE INTO clients (client_id, account_id, ip_address, port) "
+            "VALUES (?, ?, ?, ?);";
+
+        sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL);
+        sqlite3_bind_int(stmt, 1, client_id);
+        sqlite3_bind_int(stmt, 2, session->account_id);
+        sqlite3_bind_text(stmt, 3, ip, -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 4, port);
+
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
         send_response(session->socket_fd, "103\r\n");
-        printf("[INFO] Client info updated: ID=%u, IP=%s, Port=%d\n", client_id, client_ip, port);
     }
+
 
     // Handle PUBLISH command
     else if (strcmp(command, "PUBLISH") == 0) {
-        // Check if logged in
-        if (!session->is_logged_in) {
-            send_response(session->socket_fd, "403\r\n");
-            return;
-        }
-        
         uint32_t client_id;
         char filename[256];
-        
-        // Parse arguments: PUBLISH <ClientID> <filename>
-        if (sscanf(argument, "%u %255s", &client_id, filename) != 2) {
-            send_response(session->socket_fd, "300\r\n");
-            return;
-        }
-        
-        // Check if filename contains invalid characters (; or \r\n)
-        if (strchr(filename, ';') != NULL || 
-            strchr(filename, '\r') != NULL || 
-            strchr(filename, '\n') != NULL) {
-            send_response(session->socket_fd, "402\r\n");
-            return;
-        }
-        
-        // Find client connection info
-        pthread_mutex_lock(&connection_mutex);
-        char client_ip[16] = {0};
-        int client_port = 0;
-        int found = 0;
-        
-        for (int i = 0; i < connection_count; i++) {
-            if (client_connections[i].client_id == client_id && 
-                client_connections[i].is_active) {
-                strcpy(client_ip, client_connections[i].ip_address);
-                client_port = client_connections[i].p2p_port;
-                found = 1;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&connection_mutex);
-        
-        if (!found) {
-            send_response(session->socket_fd, "403\r\n");
-            return;
-        }
-        
-        // Add file to index
-        pthread_mutex_lock(&file_index_mutex);
-        
-        if (file_index_count < MAX_TOTAL_FILES) {
-            strcpy(file_index[file_index_count].filename, filename);
-            file_index[file_index_count].client_id = client_id;
-            strcpy(file_index[file_index_count].ip_address, client_ip);
-            file_index[file_index_count].port = client_port;
-            file_index[file_index_count].filesize = 0; // Unknown size
-            file_index[file_index_count].published_time = time(NULL);
-            file_index[file_index_count].is_active = 1;
-            file_index_count++;
-        }
-        
-        pthread_mutex_unlock(&file_index_mutex);
-        
-        // Send response: 201 <ClientID> <Port>
-        char response[128];
-        snprintf(response, sizeof(response), "201 %u %d\r\n", client_id, client_port);
-        send_response(session->socket_fd, response);
-        printf("[INFO] File published: %s by ClientID=%u\n", filename, client_id);
+
+        sscanf(argument, "%u %255s", &client_id, filename);
+
+        sqlite3_stmt *stmt;
+        const char *sql =
+            "INSERT INTO files (client_id, filename, filesize) VALUES (?, ?, 0);";
+
+        sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL);
+        sqlite3_bind_int(stmt, 1, client_id);
+        sqlite3_bind_text(stmt, 2, filename, -1, SQLITE_STATIC);
+
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        send_response(session->socket_fd, "201\r\n");
     }
 
     // Handle UNPUBLISH command
     else if (strcmp(command, "UNPUBLISH") == 0) {
-        // Check if logged in
         if (!session->is_logged_in) {
             send_response(session->socket_fd, "403\r\n");
             return;
         }
-        
+
         char filename[256];
-        
-        // Parse arguments: UNPUBLISH <filename>
+
         if (sscanf(argument, "%255s", filename) != 1) {
             send_response(session->socket_fd, "300\r\n");
             return;
         }
-        
-        // Find and remove file from index
-        pthread_mutex_lock(&file_index_mutex);
-        
-        int found = 0;
-        for (int i = 0; i < file_index_count; i++) {
-            if (strcmp(file_index[i].filename, filename) == 0 && 
-                file_index[i].is_active) {
-                // Mark as inactive (soft delete)
-                file_index[i].is_active = 0;
-                found = 1;
-                break;
-            }
+
+        sqlite3_stmt *stmt;
+        const char *sql =
+            "UPDATE files SET is_active = 0 "
+            "WHERE filename = ? AND client_id = ? AND is_active = 1;";
+
+        if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            send_response(session->socket_fd, "500\r\n");
+            return;
         }
-        
-        pthread_mutex_unlock(&file_index_mutex);
-        
-        if (!found) {
+
+        sqlite3_bind_text(stmt, 1, filename, -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 2, session->client_id);
+
+        int rc = sqlite3_step(stmt);
+        int rows_affected = sqlite3_changes(g_db);
+
+        sqlite3_finalize(stmt);
+
+        if (rc != SQLITE_DONE || rows_affected == 0) {
+            // File not found OR not owned by this client
             send_response(session->socket_fd, "404\r\n");
             return;
         }
-        
+
         send_response(session->socket_fd, "202\r\n");
-        printf("[INFO] File unpublished: %s\n", filename);
+        printf("[INFO] File unpublished: %s (ClientID=%u)\n",
+            filename, session->client_id);
     }
 
     // Handle SEARCH command
     else if (strcmp(command, "SEARCH") == 0) {
         char filename[256];
-        
-        // Parse arguments: SEARCH <filename>
-        if (sscanf(argument, "%255s", filename) != 1) {
-            send_response(session->socket_fd, "300\r\n");
-            return;
+
+        sscanf(argument, "%255s", filename);
+
+        sqlite3_stmt *stmt;
+        const char *sql =
+            "SELECT c.ip_address, c.port, f.client_id "
+            "FROM files f JOIN clients c ON f.client_id=c.client_id "
+            "WHERE f.filename=?;";
+
+        sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL);
+        sqlite3_bind_text(stmt, 1, filename, -1, SQLITE_STATIC);
+
+        char response[BUFF_SIZE] = "210\r\n";
+        int found = 0;
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            found = 1;
+            char line[128];
+            snprintf(line, sizeof(line), "%s %d %u\r\n",
+                    sqlite3_column_text(stmt, 0),
+                    sqlite3_column_int(stmt, 1),
+                    sqlite3_column_int(stmt, 2));
+            strcat(response, line);
         }
-        
-        // Search for file in index
-        pthread_mutex_lock(&file_index_mutex);
-        
-        char response[BUFF_SIZE];
-        strcpy(response, "210\r\n");
-        int peer_count = 0;
-        
-        for (int i = 0; i < file_index_count; i++) {
-            if (strcmp(file_index[i].filename, filename) == 0 && 
-                file_index[i].is_active) {
-                // Add peer info to response
-                char peer_line[128];
-                snprintf(peer_line, sizeof(peer_line), "%s %d %u\r\n",
-                         file_index[i].ip_address,
-                         file_index[i].port,
-                         file_index[i].client_id);
-                strcat(response, peer_line);
-                peer_count++;
-            }
-        }
-        
-        pthread_mutex_unlock(&file_index_mutex);
-        
-        if (peer_count == 0) {
+
+        sqlite3_finalize(stmt);
+
+        if (!found) {
             send_response(session->socket_fd, "404\r\n");
             return;
         }
-        
+
         send_response(session->socket_fd, response);
-        printf("[INFO] File search: %s - Found %d peers\n", filename, peer_count);
     }
 
     // Handle LOGOUT command
     else if (strcmp(command, "LOGOUT") == 0) {
+        if (!session->is_logged_in) {
+            send_response(session->socket_fd, "403\r\n");
+            return;
+        }
+
+        sqlite3_stmt *stmt;
+
+        // Mark client inactive
+        const char *sql_client =
+            "UPDATE clients SET is_active = 0 WHERE client_id = ?;";
+
+        if (sqlite3_prepare_v2(g_db, sql_client, -1, &stmt, NULL) != SQLITE_OK) {
+            send_response(session->socket_fd, "500\r\n");
+            return;
+        }
+
+        sqlite3_bind_int(stmt, 1, session->client_id);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        // Mark all files from this client inactive
+        const char *sql_files =
+            "UPDATE files SET is_active = 0 WHERE client_id = ?;";
+
+        if (sqlite3_prepare_v2(g_db, sql_files, -1, &stmt, NULL) != SQLITE_OK) {
+            send_response(session->socket_fd, "500\r\n");
+            return;
+        }
+
+        sqlite3_bind_int(stmt, 1, session->client_id);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        // Clear runtime session state
         pthread_mutex_lock(&session_mutex);
+
         session->is_logged_in = 0;
-        session->account_id = -1;
+        session->account_id  = -1;
+        session->client_id   = 0;
+
         pthread_mutex_unlock(&session_mutex);
-        
+
         send_response(session->socket_fd, "104\r\n");
-        printf("[INFO] User logged out: %s\n", session->username);
+        printf("[INFO] Client logged out (ClientID=%u)\n", session->client_id);
+    }
+}
+// =============================================================================
+// DATABASE FUNCTIONS
+// =============================================================================
+
+// Read schema.sql file into a string
+char *read_sql_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    rewind(f);
+
+    char *sql = malloc(size + 1);
+    if (!sql) {
+        fclose(f);
+        return NULL;
     }
 
-    // Unknown command
-    else {
-        send_response(session->socket_fd, "300\r\n");
+    fread(sql, 1, size, f);
+    sql[size] = '\0';
+    fclose(f);
+
+    return sql;
+}
+
+// Initialize SQLite database
+// returns: 0 on success, -1 on error
+int init_database(void) {
+    int rc;
+
+    // Open (or create) SQLite database file
+    rc = sqlite3_open("p2p.db", &g_db);
+    if (rc != SQLITE_OK) {
+        printf("[DB] Cannot open database: %s\n", sqlite3_errmsg(g_db));
+        return -1;
     }
+
+    // Read SQL schema from file
+    char *sql = read_sql_file("database/schema.sql");
+    if (!sql) {
+        printf("[DB] Cannot read database/schema.sql\n");
+        return -1;
+    }
+
+    // Execute schema SQL to initialize tables
+    char *errmsg = NULL;
+    rc = sqlite3_exec(g_db, sql, NULL, NULL, &errmsg);
+    free(sql);
+
+    if (rc != SQLITE_OK) {
+        printf("[DB] SQL execution error: %s\n", errmsg);
+        sqlite3_free(errmsg);
+        return -1;
+    }
+
+    printf("[DB] Database initialized successfully\n");
+    return 0;
+}
+
+// Encrypt password using SHA-256
+void sha256(const char *input, char output[65]) {
+    // Plain text input
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+
+    // Generate SHA-256 hash from input
+    SHA256((unsigned char*)input, strlen(input), hash);
+
+    // Convert hash to hexadecimal string
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(output + i * 2, "%02x", hash[i]);
+    }
+    output[64] = '\0';
 }
 
 
