@@ -27,39 +27,48 @@
 // =============================================================================
 
 // Client state and connection information
-typedef struct {
-    uint32_t client_id;              // 32-bit ClientID from config.txt
-    int p2p_port;                    // Port for P2P connections (6000)
-    SOCKET server_socket;            // Socket connected to main server
-    SOCKET p2p_socket;               // Socket for P2P listening
-    char username[64];               // Username after login
-    int is_logged_in;                // Login status (0 or 1)
-    char shared_directory[256];      // Directory containing shared files
+typedef struct
+{
+    uint32_t client_id;         // 32-bit ClientID from config.txt
+    int p2p_port;               // Port for P2P connections (6000)
+    SOCKET server_socket;       // Socket connected to main server
+    SOCKET p2p_socket;          // Socket for P2P listening
+    char username[64];          // Username after login
+    int is_logged_in;           // Login status (0 or 1)
+    char shared_directory[256]; // Directory containing shared files
+    char recv_buffer[BUFF_SIZE];
+    size_t buffer_len;
+    time_t last_active;
+    int is_active
 } ClientState;
 
 // Information about a shared file
-typedef struct {
-    char filename[256];              // File name
-    uint64_t filesize;               // File size in bytes
-    char filepath[512];              // Full path to file
+typedef struct
+{
+    char filename[256]; // File name
+    uint64_t filesize;  // File size in bytes
+    char filepath[512]; // Full path to file
 } FileInfo;
 
 // Information about a peer client
-typedef struct {
-    uint32_t client_id;              // Peer's ClientID
-    char ip_address[16];             // Peer's IP (xxx.xxx.xxx.xxx)
-    int port;                        // Peer's P2P port
+typedef struct
+{
+    uint32_t client_id;  // Peer's ClientID
+    char ip_address[16]; // Peer's IP (xxx.xxx.xxx.xxx)
+    int port;            // Peer's P2P port
 } PeerInfo;
 
 // Search results for a file
-typedef struct {
-    char filename[256];              // File being searched
-    int peer_count;                  // Number of peers with this file
-    PeerInfo peers[MAX_PEERS];       // Array of peers
+typedef struct
+{
+    char filename[256];        // File being searched
+    int peer_count;            // Number of peers with this file
+    PeerInfo peers[MAX_PEERS]; // Array of peers
 } SearchResult;
 
 // List of shared files
-typedef struct {
+typedef struct
+{
     FileInfo files[MAX_SHARED_FILES];
     int count;
 } SharedFileList;
@@ -71,69 +80,185 @@ typedef struct {
 ClientState g_client;                // Global client state
 SharedFileList g_shared_files = {0}; // Global shared files list
 
+ssize_t send_all(SOCKET sock, const char *buf, size_t len)
+{
+    size_t total = 0;
+    while (total < len)
+    {
+        ssize_t sent = send(sock, buf + total, (int)(len - total), 0);
+        if (sent <= 0)
+            return -1;
+        total += sent;
+    }
+    return (ssize_t)total;
+}
+
+ssize_t find_crlf(const char *buf, size_t len)
+{
+    if (len < 2)
+        return -1;
+    for (size_t i = 0; i + 1 < len; ++i)
+    {
+        if (buf[i] == '\r' && buf[i + 1] == '\n')
+            return (ssize_t)i;
+    }
+    return -1;
+}
+// đọc dữ liệu từ socket và tách dòng
+void session_loop(ClientState *client)
+{
+    client->is_active = 1;
+    client->buffer_len = 0;
+
+    while (client->is_active)
+    {
+        // ----- recv -----
+        int sock = client->server_socket;
+        size_t cap = sizeof(client->recv_buffer);
+
+        if (client->buffer_len >= cap - 1)
+            break;
+
+        size_t max_read = cap - client->buffer_len - 1;
+
+        int avail = recv(sock,
+                         client->recv_buffer + client->buffer_len,
+                         max_read, 0);
+
+        if (avail == 0)
+        {
+            printf("[INFO] Server closed connection\n");
+            break;
+        }
+        else if (avail < 0)
+        {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK || err == WSAEINTR)
+            {
+                Sleep(10);
+                continue;
+            }
+
+            printf("[ERROR] recv failed: %d\n", err);
+            break;
+        }
+
+        client->buffer_len += avail;
+        client->recv_buffer[client->buffer_len] = '\0';
+
+        // ----- extract lines -----
+        while (1)
+        {
+            ssize_t idx = find_crlf(client->recv_buffer, client->buffer_len);
+            if (idx < 0)
+                break;
+
+            size_t len = (size_t)idx;
+            char *line = malloc(len + 1);
+            memcpy(line, client->recv_buffer, len);
+            line[len] = '\0';
+
+            size_t remain = client->buffer_len - (len + 2);
+            memmove(client->recv_buffer,
+                    client->recv_buffer + len + 2,
+                    remain);
+
+            client->buffer_len = remain;
+            client->recv_buffer[client->buffer_len] = '\0';
+
+            // print server response
+            print_response_message(line);
+
+            free(line);
+        }
+    }
+
+    closesocket(client->server_socket);
+    client->is_active = 0;
+}
+
 // =============================================================================
 // PROTOCOL RESPONSE FUNCTIONS
 // =============================================================================
 
 // Print response messages based on server codes
-void print_response_message(const char *response) {
+void print_response_message(const char *response)
+{
     // 1xx: Connection and authentication responses
-    if (strncmp(response, "100", 3) == 0) {
+    if (strncmp(response, "100", 3) == 0)
+    {
         printf("[SUCCESS] Connected to server successfully\n");
     }
-    else if (strncmp(response, "101", 3) == 0) {
+    else if (strncmp(response, "101", 3) == 0)
+    {
         printf("[SUCCESS] Registered successfully\n");
     }
-    else if (strncmp(response, "102", 3) == 0) {
+    else if (strncmp(response, "102", 3) == 0)
+    {
         printf("[SUCCESS] Logged in successfully\n");
     }
-    else if (strncmp(response, "103", 3) == 0) {
+    else if (strncmp(response, "103", 3) == 0)
+    {
         printf("[SUCCESS] Client info sent successfully\n");
     }
-    else if (strncmp(response, "104", 3) == 0) {
+    else if (strncmp(response, "104", 3) == 0)
+    {
         printf("[SUCCESS] Logged out successfully\n");
     }
     // 2xx: File operation responses
-    else if (strncmp(response, "201", 3) == 0) {
+    else if (strncmp(response, "201", 3) == 0)
+    {
         printf("[SUCCESS] File published for sharing successfully\n");
     }
-    else if (strncmp(response, "202", 3) == 0) {
+    else if (strncmp(response, "202", 3) == 0)
+    {
         printf("[SUCCESS] File removed from publishing successfully\n");
     }
-    else if (strncmp(response, "210", 3) == 0) {
+    else if (strncmp(response, "210", 3) == 0)
+    {
         printf("[SUCCESS] File found\n");
     }
-    else if (strncmp(response, "211", 3) == 0) {
+    else if (strncmp(response, "211", 3) == 0)
+    {
         printf("[SUCCESS] File download started\n");
     }
-    else if (strncmp(response, "212", 3) == 0) {
+    else if (strncmp(response, "212", 3) == 0)
+    {
         printf("[SUCCESS] File list retrieved\n");
     }
     // 3xx: Protocol errors
-    else if (strncmp(response, "300", 3) == 0) {
+    else if (strncmp(response, "300", 3) == 0)
+    {
         printf("[ERROR] Invalid message format\n");
     }
     // 4xx: Client errors
-    else if (strncmp(response, "400", 3) == 0) {
+    else if (strncmp(response, "400", 3) == 0)
+    {
         printf("[ERROR] Username already exists or invalid password\n");
     }
-    else if (strncmp(response, "401", 3) == 0) {
+    else if (strncmp(response, "401", 3) == 0)
+    {
         printf("[ERROR] Username does not exist or incorrect password\n");
     }
-    else if (strncmp(response, "402", 3) == 0) {
+    else if (strncmp(response, "402", 3) == 0)
+    {
         printf("[ERROR] Invalid filename\n");
     }
-    else if (strncmp(response, "403", 3) == 0) {
+    else if (strncmp(response, "403", 3) == 0)
+    {
         printf("[ERROR] User not logged in yet\n");
     }
-    else if (strncmp(response, "404", 3) == 0) {
+    else if (strncmp(response, "404", 3) == 0)
+    {
         printf("[ERROR] File not found\n");
     }
     // 5xx: Server errors
-    else if (strncmp(response, "500", 3) == 0) {
+    else if (strncmp(response, "500", 3) == 0)
+    {
         printf("[ERROR] Server error\n");
     }
-    else {
+    else
+    {
         printf("[RESPONSE] %s", response);
     }
 }
@@ -143,7 +268,8 @@ void print_response_message(const char *response) {
 // =============================================================================
 
 // Initialize client state
-void init_client_state() {
+void init_client_state()
+{
     memset(&g_client, 0, sizeof(ClientState));
     g_client.p2p_port = P2P_PORT;
     g_client.server_socket = INVALID_SOCKET;
@@ -153,32 +279,37 @@ void init_client_state() {
 }
 
 // Load shared files from index.txt
-int load_shared_files() {
+int load_shared_files()
+{
     FILE *fp = fopen("index.txt", "r");
-    if (!fp) {
+    if (!fp)
+    {
         printf("[INFO] index.txt not found, no files to share\n");
         return 0;
     }
-    
+
     g_shared_files.count = 0;
     char line[768];
-    
-    while (fgets(line, sizeof(line), fp) && g_shared_files.count < MAX_SHARED_FILES) {
+
+    while (fgets(line, sizeof(line), fp) && g_shared_files.count < MAX_SHARED_FILES)
+    {
         // Remove newline
         line[strcspn(line, "\r\n")] = 0;
-        
+
         // Parse line: filename|filepath
         char *token = strtok(line, "|");
-        if (token) {
+        if (token)
+        {
             strncpy(g_shared_files.files[g_shared_files.count].filename, token, 255);
             token = strtok(NULL, "|");
-            if (token) {
+            if (token)
+            {
                 strncpy(g_shared_files.files[g_shared_files.count].filepath, token, 511);
                 g_shared_files.count++;
             }
         }
     }
-    
+
     fclose(fp);
     printf("[INFO] Loaded %d shared files from index.txt\n", g_shared_files.count);
     return g_shared_files.count;
@@ -193,49 +324,57 @@ int load_shared_files() {
 //         client_id - 32-bit ClientID
 //         p2p_port - P2P listening port
 // returns: 0 on success, -1 on error
-int send_client_info(SOCKET sock, uint32_t client_id, int p2p_port) {
+int send_client_info(SOCKET sock, uint32_t client_id, int p2p_port)
+{
     char message[256];
     char response[BUFF_SIZE];
-    
+
     // Validate parameters
-    if (sock == INVALID_SOCKET) {
+    if (sock == INVALID_SOCKET)
+    {
         printf("[ERROR] Invalid socket\n");
         return -1;
     }
-    
-    if (p2p_port <= 0 || p2p_port > 65535) {
+
+    if (p2p_port <= 0 || p2p_port > 65535)
+    {
         printf("[ERROR] Invalid port number: %d\n", p2p_port);
         return -1;
     }
-    
+
     // Build SENDINFO message: "SENDINFO <ClientID> <P2PPort>\r\n"
     snprintf(message, sizeof(message), "SENDINFO %u %d\r\n", client_id, p2p_port);
-    
+
     printf("[INFO] Sending client info to server...\n");
     printf("[DEBUG] Message: %s", message);
-    
+
     // Send message to server
-    if (send_message(sock, message) < 0) {
+    if (send_message(sock, message) < 0)
+    {
         printf("[ERROR] Failed to send SENDINFO message\n");
         return -1;
     }
-    
+
     // Receive response from server
     int received = receive_response(sock, response, sizeof(response));
-    if (received <= 0) {
+    if (received <= 0)
+    {
         printf("[ERROR] Failed to receive response from server\n");
         return -1;
     }
-    
+
     // Print server response
     print_response_message(response);
-    
+
     // Check if operation was successful (response code 103)
-    if (strncmp(response, "103", 3) == 0) {
+    if (strncmp(response, "103", 3) == 0)
+    {
         printf("[INFO] Client info registered on server successfully\n");
         printf("[INFO] ClientID: %u, P2P Port: %d\n", client_id, p2p_port);
         return 0;
-    } else {
+    }
+    else
+    {
         printf("[ERROR] Server rejected client info\n");
         return -1;
     }
@@ -243,45 +382,53 @@ int send_client_info(SOCKET sock, uint32_t client_id, int p2p_port) {
 
 // Automatically send client info after login
 // returns: 0 on success, -1 on error
-int auto_send_client_info() {
+int auto_send_client_info()
+{
     // Check if client is logged in
-    if (!g_client.is_logged_in) {
+    if (!g_client.is_logged_in)
+    {
         printf("[ERROR] Must login before sending client info\n");
         return -1;
     }
-    
+
     // Check if server socket is valid
-    if (g_client.server_socket == INVALID_SOCKET) {
+    if (g_client.server_socket == INVALID_SOCKET)
+    {
         printf("[ERROR] Not connected to server\n");
         return -1;
     }
-    
+
     // Send client info
-    return send_client_info(g_client.server_socket, 
-                           g_client.client_id, 
-                           g_client.p2p_port);
+    return send_client_info(g_client.server_socket,
+                            g_client.client_id,
+                            g_client.p2p_port);
 }
 
 // Update P2P port and notify server
 // params: new_port - new P2P port number
 // returns: 0 on success, -1 on error
-int update_client_port(int new_port) {
-    if (new_port <= 0 || new_port > 65535) {
+int update_client_port(int new_port)
+{
+    if (new_port <= 0 || new_port > 65535)
+    {
         printf("[ERROR] Invalid port number\n");
         return -1;
     }
-    
+
     // Update local state
     int old_port = g_client.p2p_port;
     g_client.p2p_port = new_port;
-    
+
     // Send updated info to server
-    if (send_client_info(g_client.server_socket, 
-                        g_client.client_id, 
-                        g_client.p2p_port) == 0) {
+    if (send_client_info(g_client.server_socket,
+                         g_client.client_id,
+                         g_client.p2p_port) == 0)
+    {
         printf("[INFO] Port updated from %d to %d\n", old_port, new_port);
         return 0;
-    } else {
+    }
+    else
+    {
         // Revert on failure
         g_client.p2p_port = old_port;
         printf("[ERROR] Failed to update port on server\n");
@@ -289,37 +436,41 @@ int update_client_port(int new_port) {
     }
 }
 
-
 // =============================================================================
 // SERVER CONNECTION FUNCTIONS
 // =============================================================================
 // Connect to server
-SOCKET connect_to_server(const char *server_ip, int server_port) {
+SOCKET connect_to_server(const char *server_ip, int server_port)
+{
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
+    if (sock == INVALID_SOCKET)
+    {
         printf("[ERROR] Cannot create socket: %d\n", WSAGetLastError());
         return INVALID_SOCKET;
     }
-    
+
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(server_port);
     inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
-    
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+
+    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == SOCKET_ERROR)
+    {
         printf("[ERROR] Cannot connect to server %s:%d - %d\n", server_ip, server_port, WSAGetLastError());
         closesocket(sock);
         return INVALID_SOCKET;
     }
-    
+
     printf("[INFO] Connected to server %s:%d successfully\n", server_ip, server_port);
     return sock;
 }
 
 // Disconnect from server
-void disconnect_from_server(SOCKET sock) {
-    if (sock != INVALID_SOCKET) {
+void disconnect_from_server(SOCKET sock)
+{
+    if (sock != INVALID_SOCKET)
+    {
         closesocket(sock);
         printf("[INFO] Disconnected from server\n");
     }
@@ -331,94 +482,106 @@ void disconnect_from_server(SOCKET sock) {
 
 // Send message to server (Example: "LOGIN username password\r\n")
 // Returns: number of bytes sent, or -1 on error
-int send_message(SOCKET sock, const char *message) {
+int send_message(SOCKET sock, const char *message)
+{
     int len = strlen(message);
     int total_sent = 0;
-    
+
     // Keep sending until entire message is sent
-    while (total_sent < len) {
+    while (total_sent < len)
+    {
         int sent = send(sock, message + total_sent, len - total_sent, 0);
-        
-        if (sent == SOCKET_ERROR) {
+
+        if (sent == SOCKET_ERROR)
+        {
             printf("[ERROR] Send failed: %d\n", WSAGetLastError());
             return -1;
         }
-        
+
         total_sent += sent;
     }
-    
+
     return total_sent;
 }
 
 // Receive response from server
 // Returns: number of bytes received, 0 if connection closed, -1 on error
-int receive_response(SOCKET sock, char *buffer, int buffer_size) {
+int receive_response(SOCKET sock, char *buffer, int buffer_size)
+{
     // Clear buffer first
     memset(buffer, 0, buffer_size);
-    
+
     // Receive data
     int received = recv(sock, buffer, buffer_size - 1, 0);
-    
-    if (received == SOCKET_ERROR) {
+
+    if (received == SOCKET_ERROR)
+    {
         printf("[ERROR] Receive failed: %d\n", WSAGetLastError());
         return -1;
     }
-    
-    if (received == 0) {
+
+    if (received == 0)
+    {
         printf("[INFO] Connection closed by server\n");
         return 0;
     }
-    
+
     // Null-terminate the string
     buffer[received] = '\0';
-    
+
     return received;
 }
 
 // Receive complete response (handles multi-line responses like SEARCH results)
 // Returns: total bytes received, or -1 on error
-int receive_full_response(SOCKET sock, char *buffer, int buffer_size) {
+int receive_full_response(SOCKET sock, char *buffer, int buffer_size)
+{
     memset(buffer, 0, buffer_size);
     int total_received = 0;
-    
+
     // Set a timeout for receiving data (optional but recommended)
-    DWORD timeout = 5000;  // 5 seconds
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-    
+    DWORD timeout = 5000; // 5 seconds
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+
     // Keep receiving until we get a complete response
-    while (total_received < buffer_size - 1) {
-        int received = recv(sock, buffer + total_received, 
-                           buffer_size - total_received - 1, 0);
-        
-        if (received == SOCKET_ERROR) {
+    while (total_received < buffer_size - 1)
+    {
+        int received = recv(sock, buffer + total_received,
+                            buffer_size - total_received - 1, 0);
+
+        if (received == SOCKET_ERROR)
+        {
             int error = WSAGetLastError();
-            if (error == WSAETIMEDOUT) {
+            if (error == WSAETIMEDOUT)
+            {
                 // Timeout - assume response is complete
                 break;
             }
             printf("[ERROR] Receive failed: %d\n", error);
             return -1;
         }
-        
-        if (received == 0) {
+
+        if (received == 0)
+        {
             // Connection closed
             break;
         }
-        
+
         total_received += received;
-        
+
         // Small delay to allow more data to arrive
         Sleep(10);
-        
+
         // Check if more data is available
         u_long bytes_available = 0;
         ioctlsocket(sock, FIONREAD, &bytes_available);
-        if (bytes_available == 0) {
+        if (bytes_available == 0)
+        {
             // No more data available
             break;
         }
     }
-    
+
     buffer[total_received] = '\0';
     return total_received;
 }
@@ -427,45 +590,51 @@ int receive_full_response(SOCKET sock, char *buffer, int buffer_size) {
 // MAIN PROGRAM
 // =============================================================================
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
     // Initialize Winsock
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+    {
         printf("[ERROR] WSAStartup failed: %d\n", WSAGetLastError());
         return 1;
     }
-    
+
     // Initialize client state
     init_client_state();
-    
+
     // Load or generate ClientID
-    if (!load_client_id(&g_client.client_id)) {
+    if (!load_client_id(&g_client.client_id))
+    {
         // If not found, generate new ClientID
         g_client.client_id = generate_client_id();
-        if (!save_client_id(g_client.client_id)) {
+        if (!save_client_id(g_client.client_id))
+        {
             printf("[ERROR] Cannot save client ID to config.txt\n");
             WSACleanup();
             return 1;
         }
         printf("[INFO] First time run. Generated Client ID: %u\n", g_client.client_id);
-    } else {
+    }
+    else
+    {
         printf("[INFO] Loaded existing Client ID: %u\n", g_client.client_id);
     }
-    
+
     // Load shared files from index.txt
     load_shared_files();
-    
+
     printf("[INFO] P2P Client initialized successfully\n");
     printf("[INFO] Client ID: %u\n", g_client.client_id);
     printf("[INFO] P2P Port: %d\n", g_client.p2p_port);
     printf("[INFO] Shared files: %d\n", g_shared_files.count);
-    
+
     // TODO: Connect to server
     // TODO: Login/Register
     // TODO: Send GETINFO
     // TODO: Publish files
     // TODO: Handle user commands
-    
+
     WSACleanup();
     return 0;
 }
