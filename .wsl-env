@@ -1,0 +1,230 @@
+#!/bin/bash
+# Local development environment setup for WSL
+
+# Base project directory (adjust based on your WSL home directory)
+export PROJECT_ROOT="$HOME/file-sharing-project"
+
+# Client directory
+export CLIENT_DIR="$PROJECT_ROOT/client"
+
+# Server directory  
+export SERVER_DIR="$PROJECT_ROOT/server"
+
+# Database directory
+export DB_DIR="$PROJECT_ROOT/database"
+
+# Binary output directory
+export BIN_DIR="$PROJECT_ROOT/bin"
+
+# Server configuration
+export SERVER_PORT=8000
+export P2P_PORT=6000
+export SERVER_IP="127.0.0.1"
+
+# Database configuration
+export DATABASE_FILE="$DB_DIR/server.db"
+export INDEX_FILE="$PROJECT_ROOT/index.txt"
+
+# Client configuration
+export CLIENT_ID_FILE="$PROJECT_ROOT/config.txt"
+export CLIENT_INDEX_FILE="$CLIENT_DIR/index.txt"
+
+# Compiler
+export CC=gcc
+export CFLAGS="-Wall -Wextra -g -O2 -pthread"
+
+# SQLite flags
+export SQLITE_CFLAGS="$(pkg-config --cflags sqlite3 2>/dev/null || echo '')"
+export SQLITE_LIBS="$(pkg-config --libs sqlite3 2>/dev/null || echo '-lsqlite3')"
+
+# OpenSSL flags
+export SSL_CFLAGS="$(pkg-config --cflags openssl 2>/dev/null || echo '')"
+export SSL_LIBS="$(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
+
+# Network libraries
+export NETWORK_LIBS="-lpthread"
+
+# Create bin directory
+mkdir -p "$BIN_DIR"
+
+# Compile server with all dependencies
+compile_server() {
+    echo "Compiling server..."
+    $CC $CFLAGS $SQLITE_CFLAGS $SSL_CFLAGS \
+        -o "$BIN_DIR/server" \
+        "$SERVER_DIR/server.c" \
+        "$PROJECT_ROOT/config.c" \
+        $SQLITE_LIBS $SSL_LIBS $NETWORK_LIBS
+    
+    if [ $? -eq 0 ]; then
+        echo "Server compiled successfully: $BIN_DIR/server"
+    else
+        echo "Server compilation failed"
+        return 1
+    fi
+}
+
+# Compile client
+compile_client() {
+    echo "Compiling client..."
+    $CC $CFLAGS $SQLITE_CFLAGS $SSL_CFLAGS \
+        -o "$BIN_DIR/client" \
+        "$CLIENT_DIR/client.c" \
+        "$PROJECT_ROOT/config.c" \
+        $SQLITE_LIBS $SSL_LIBS $NETWORK_LIBS
+    
+    if [ $? -eq 0 ]; then
+        echo "Client compiled successfully: $BIN_DIR/client"
+    else
+        echo "Client compilation failed"
+        return 1
+    fi
+}
+
+# Compile both
+compile_all() {
+    compile_server && compile_client
+}
+
+# Initialize database schema
+init_database() {
+    echo "Initializing database..."
+    mkdir -p "$DB_DIR"
+    
+    if [ -f "$PROJECT_ROOT/schema.sql" ]; then
+        sqlite3 "$DATABASE_FILE" < "$PROJECT_ROOT/schema.sql"
+        if [ $? -eq 0 ]; then
+            echo "Database initialized: $DATABASE_FILE"
+        else
+            echo "Failed to initialize database"
+        fi
+    else
+        echo "Schema file not found: $PROJECT_ROOT/schema.sql"
+    fi
+}
+
+# Run server
+run_server() {
+    echo "Starting server on port $SERVER_PORT..."
+    "$BIN_DIR/server"
+}
+
+# Run client
+run_client() {
+    echo "Starting client..."
+    "$BIN_DIR/client"
+}
+
+# Run server in background
+run_server_bg() {
+    echo "Starting server in background..."
+    "$BIN_DIR/server" &
+    SERVER_PID=$!
+    echo "Server started with PID: $SERVER_PID"
+}
+
+# Clean compiled binaries
+clean_bin() {
+    echo "Cleaning binaries..."
+    rm -rf "$BIN_DIR"
+}
+
+# Clean database and index files
+clean_data() {
+    echo "Cleaning data files..."
+    rm -f "$DATABASE_FILE"
+    rm -f "$INDEX_FILE"
+    rm -f "$CLIENT_ID_FILE"
+    rm -f "$CLIENT_INDEX_FILE"
+}
+
+# Clean everything
+clean_all() {
+    clean_bin
+    clean_data
+    echo "All cleaned up"
+}
+
+# Setup complete project environment
+setup_project() {
+    echo "Setting up project environment..."
+    
+    # Create directories
+    mkdir -p "$CLIENT_DIR"
+    mkdir -p "$SERVER_DIR"
+    mkdir -p "$DB_DIR"
+    mkdir -p "$BIN_DIR"
+    
+    # Check for required files
+    echo "Checking required files..."
+    
+    if [ ! -f "$SERVER_DIR/server.c" ]; then
+        echo "Warning: server.c not found in $SERVER_DIR"
+    fi
+    
+    if [ ! -f "$CLIENT_DIR/client.c" ]; then
+        echo "Warning: client.c not found in $CLIENT_DIR"
+    fi
+    
+    if [ ! -f "$PROJECT_ROOT/config.h" ]; then
+        echo "Warning: config.h not found in $PROJECT_ROOT"
+    fi
+    
+    if [ ! -f "$PROJECT_ROOT/config.c" ]; then
+        echo "Warning: config.c not found in $PROJECT_ROOT"
+    fi
+    
+    if [ ! -f "$PROJECT_ROOT/schema.sql" ]; then
+        echo "Warning: schema.sql not found in $PROJECT_ROOT"
+    fi
+    
+    # Initialize database
+    init_database
+    
+    echo "Project setup complete!"
+    echo "Project root: $PROJECT_ROOT"
+    echo "Use 'compile_all' to build, 'run_server' to start server"
+}
+
+# Check for required dependencies
+check_dependencies() {
+    echo "Checking dependencies..."
+    
+    # Check GCC
+    if command -v gcc >/dev/null 2>&1; then
+        echo "✓ GCC compiler"
+    else
+        echo "✗ GCC compiler not found"
+        return 1
+    fi
+    
+    # Check SQLite3
+    if command -v sqlite3 >/dev/null 2>&1; then
+        echo "✓ SQLite3"
+    else
+        echo "✗ SQLite3 not found"
+        echo "  Install with: sudo apt-get install sqlite3 libsqlite3-dev"
+    fi
+    
+    # Check OpenSSL
+    if command -v openssl >/dev/null 2>&1; then
+        echo "✓ OpenSSL"
+    else
+        echo "✗ OpenSSL not found"
+        echo "  Install with: sudo apt-get install libssl-dev"
+    fi
+    
+    # Check pkg-config
+    if command -v pkg-config >/dev/null 2>&1; then
+        echo "✓ pkg-config"
+    else
+        echo "✗ pkg-config not found"
+        echo "  Install with: sudo apt-get install pkg-config"
+    fi
+    
+    echo "Dependency check complete"
+}
+
+
+
+
