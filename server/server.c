@@ -24,10 +24,10 @@
 #define BUFF_SIZE 8192               // Buffer size for socket I/O operations
 #define MAX_CLIENTS 128              // Maximum number of concurrent client connections
 #define MAX_TOTAL_FILES 4096         // Maximum number of files in the index
-#define BACKLOG 20                   // Maximum pending connections in listen queue
 #define INDEX_FILE "index.txt"       // File name for storing the file index
 #define DATABASE_FILE "database"    // SQLite database file for account management
 #define PASSWORD_HASH_LENGTH 65      // Length of SHA256 hex string + null terminator
+#define LOG_FILE "logs.txt"          // Log file name
 
 /* =============================================================================
    STRUCTS
@@ -88,6 +88,8 @@ pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 sqlite3 *db = NULL;
 pthread_mutex_t db_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* =============================================================================
    UTILITY FUNCTIONS
    ============================================================================= */
@@ -139,6 +141,53 @@ ssize_t find_crlf(const char *buf, size_t len)
             return (ssize_t)i;
     }
     return -1;
+}
+
+// Logs client transaction activity to a file (server.log).
+// Format: [TIMESTAMP] $ OK/ERR $ [COMMAND] from [ClientID] at [IP:Port] $ [STATUS CODE]
+void log_to_file(const char *status, const char *command, uint32_t client_id, 
+                 const char *ip_address, int port, const char *status_code) 
+{
+    char timestamp[32];
+    time_t now = time(NULL);
+    
+    // 1. Get the current TIMESTAMP (Format: YYYY-MM-DD HH:MM:SS)
+    if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now)) == 0) {
+        // This should rarely fail unless buffer is too small
+        fprintf(stderr, "[FATAL] Failed to format log timestamp.\n");
+        return;
+    }
+
+    // 2. Format the complete log string
+    char log_line[BUFF_SIZE];
+    int written = snprintf(log_line, sizeof(log_line),
+        "[%s] $ %s $ %s from %u at %s:%d $ %s\n",
+        timestamp,
+        status,
+        command,
+        client_id,
+        ip_address,
+        port,
+        status_code
+    );
+
+    if (written >= sizeof(log_line)) {
+        // Warning if the log line exceeds buffer size and was truncated
+        fprintf(stderr, "[WARNING] Log message truncated: %s\n", log_line);
+    }
+
+    // 3. Write log to file (Uses Mutex for multi-threading safety)
+    pthread_mutex_lock(&log_mutex);
+
+    FILE *fp = fopen(LOG_FILE, "a"); // "a" mode opens the file for appending
+    if (fp == NULL) {
+        perror("[FATAL] Failed to open log file for writing");
+    } else {
+        fprintf(fp, "%s", log_line);
+        fclose(fp); // Close file immediately after writing
+    }
+
+    pthread_mutex_unlock(&log_mutex);
 }
 
 /* =============================================================================
@@ -389,12 +438,18 @@ void handle_sendinfo(Session *session, uint32_t client_id, int port) {
     // Check if client is authenticated
     if (!session->is_logged_in) {
         send_response(session->socket_fd, "403\r\n");
+        log_to_file("ERR", "SENDINFO", 0,
+                    inet_ntoa(session->client_addr.sin_addr),
+                    ntohs(session->client_addr.sin_port), "403");
         return;
     }
     
     // Validate port range
     if (port < 1024 || port > 65535) {
         send_response(session->socket_fd, "301\r\n");
+        log_to_file("ERR", "SENDINFO", session->client_id,
+                    inet_ntoa(session->client_addr.sin_addr),
+                    ntohs(session->client_addr.sin_port), "301");
         return;
     }
     
@@ -402,6 +457,9 @@ void handle_sendinfo(Session *session, uint32_t client_id, int port) {
     char client_ip[INET_ADDRSTRLEN];
     if (inet_ntop(AF_INET, &(session->client_addr.sin_addr), client_ip, sizeof(client_ip)) == NULL) {
         send_response(session->socket_fd, "500\r\n");
+        log_to_file("ERR", "SENDINFO", session->client_id,
+                    inet_ntoa(session->client_addr.sin_addr),
+                    ntohs(session->client_addr.sin_port), "500");
         return;
     }
     
@@ -412,6 +470,9 @@ void handle_sendinfo(Session *session, uint32_t client_id, int port) {
             client_infos[i].account_id != session->account_id) {
             pthread_mutex_unlock(&client_mutex);
             send_response(session->socket_fd, "405\r\n"); // Client ID already in use
+            log_to_file("ERR", "SENDINFO", client_id,
+                        inet_ntoa(session->client_addr.sin_addr),
+                        ntohs(session->client_addr.sin_port), "405");
             return;
         }
     }
@@ -427,6 +488,9 @@ void handle_sendinfo(Session *session, uint32_t client_id, int port) {
     send_response(session->socket_fd, "103\r\n");
     printf("[INFO] Client info updated: Account=%d, ID=%u, IP=%s, Port=%d\n", 
            session->account_id, client_id, client_ip, port);
+    log_to_file("OK", "SENDINFO", client_id,
+                inet_ntoa(session->client_addr.sin_addr),
+                ntohs(session->client_addr.sin_port), "103");
 }
 
 // Handle SEARCH command from client
@@ -441,6 +505,7 @@ void handle_search(Session *session, const char *filename) {
 
     // 2. Prepare response buffer
     char response[BUFF_SIZE * 2]; 
+
     // Start building the response with the success code (210 - File found, starting list)
     int len = snprintf(response, sizeof(response), "210\r\n"); 
     int file_found = 0; // Counter and flag to track if any peer was found
@@ -468,6 +533,9 @@ void handle_search(Session *session, const char *filename) {
         fprintf(stderr, "[ERROR] SQL error on SEARCH prepare: %s\n", sqlite3_errmsg(db));
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n"); // 500: Internal server error
+        log_to_file("ERR", "SEARCH", session->client_id,
+                    inet_ntoa(session->client_addr.sin_addr),
+                    ntohs(session->client_addr.sin_port), "500");
         return;
     }
     
@@ -515,11 +583,19 @@ void handle_search(Session *session, const char *filename) {
         if (send(session->socket_fd, response, len, 0) < 0) {
             perror("[ERROR] Failed to send search results");
         }
+
         printf("[INFO] Sent search results for file '%s' (Total peers: %d)\n", filename, file_found);
+        log_to_file("OK", "SEARCH", session->client_id,
+                    inet_ntoa(session->client_addr.sin_addr),
+                    ntohs(session->client_addr.sin_port), "210");
+
     } else {
         // If no rows were found, send the 'Not Found' error code
         send_response(session->socket_fd, "404\r\n"); // 404: File not found
         printf("[INFO] File '%s' not found. Sent 404.\n", filename);
+        log_to_file("OK", "SEARCH", session->client_id,
+                    inet_ntoa(session->client_addr.sin_addr),
+                    ntohs(session->client_addr.sin_port), "404");
     }
 }
 
