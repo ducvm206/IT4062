@@ -512,13 +512,14 @@ void disconnect_from_server(int sock) {
     }
 }
 
-// =============================================================================
-// DEMONSTRATION MAIN FUNCTION
-// =============================================================================
 
 int main(int argc, char *argv[]) {
     // Initialize client state
     init_client_state();
+
+    // Connect to main server
+    const char *SERVER_IP = "127.0.0.1";
+    g_client.server_socket = connect_to_server(SERVER_IP, SERVER_PORT);
     
     // Load or generate ClientID
     if (!load_client_id(&g_client.client_id)) {
@@ -540,9 +541,6 @@ int main(int argc, char *argv[]) {
     printf("[INFO] P2P Port: %d\n", g_client.p2p_port);
     printf("[INFO] Shared files: %d\n", g_shared_files.count);
     
-    // --- DEMO USAGE ---
-    // The rest of the main function should contain demo logic for connect, 
-    // login, sendinfo, publish, search, etc., which is not fully provided here.
     
     return 0;
 }

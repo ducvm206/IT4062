@@ -66,10 +66,6 @@ typedef struct
     time_t published_time;           // Timestamp when file was published
 } FileIndexEntry;
 
-
-
-
-
 /* =============================================================================
    GLOBAL VARIABLES
    ============================================================================= */
@@ -133,7 +129,6 @@ void send_response(int socket_fd, const char *response)
 //   buf: Buffer to search
 //   len: Length of data in buffer
 // Returns: Index of '\r' if found, -1 if not found
-
 ssize_t find_crlf(const char *buf, size_t len)
 {
     if (len < 2)
@@ -410,7 +405,7 @@ void handle_sendinfo(Session *session, uint32_t client_id, int port) {
         return;
     }
     
-    // Check if this client_id is already registered to another account
+    // Check if this client_id is already being used by another account
     pthread_mutex_lock(&client_mutex);
     for (int i = 0; i < client_info_count; i++) {
         if (client_infos[i].client_id == client_id && 
@@ -438,48 +433,57 @@ void handle_sendinfo(Session *session, uint32_t client_id, int port) {
 // Command format: SEARCH <Filename>
 void handle_search(Session *session, const char *filename) {
     // 1. Check login status
+    // The SEARCH command requires the client to be logged in to ensure authorization.
     if (!session->is_logged_in) {
-        send_response(session->socket_fd, "403\r\n"); // 403: User not logged in
+        send_response(session->socket_fd, "403\r\n"); // 403: User not logged in (Forbidden)
         return;
     }
 
     // 2. Prepare response buffer
-    // Buffer is sized to hold status code 210, the list of peers (IP/Port), and the termination line '.'.
     char response[BUFF_SIZE * 2]; 
-    int len = snprintf(response, sizeof(response), "210\r\n"); // 210: File found (start list)
-    int file_found = 0;
+    // Start building the response with the success code (210 - File found, starting list)
+    int len = snprintf(response, sizeof(response), "210\r\n"); 
+    int file_found = 0; // Counter and flag to track if any peer was found
 
     // 3. Prepare and execute SQL query
     sqlite3_stmt *stmt;
     const char *tail;
     
-    // QUERY: Select DISTINCT ClientID, IP, and Port from the clients table for all files matching the filename.
+    // SQL QUERY: Select DISTINCT ClientID, IP Address, and P2P Port from the clients table 
+    // for all files matching the specified filename. This effectively finds all peers
+    // who are sharing this file.
     const char *query = 
         "SELECT DISTINCT c.client_id, c.ip_address, c.port "
         "FROM files f "
         "JOIN clients c ON f.client_id = c.client_id "
-        "WHERE f.filename = ?;"; // Use '?' to safely bind the filename parameter
-        
+        "WHERE f.filename = ?;"; // Use '?' as a placeholder for the filename
+
+    // Acquire the database lock to prevent concurrent write/read issues
     pthread_mutex_lock(&db_mutex);
 
+    // Prepare the SQL statement for execution
     int rc = sqlite3_prepare_v2(db, query, -1, &stmt, &tail);
     if (rc != SQLITE_OK) {
+        // Handle SQL preparation error
         fprintf(stderr, "[ERROR] SQL error on SEARCH prepare: %s\n", sqlite3_errmsg(db));
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n"); // 500: Internal server error
         return;
     }
     
-    // Bind filename to the placeholder (?) to prevent SQL Injection
+    // Bind the filename argument to the placeholder (?) to safely handle user input 
+    // and prevent SQL Injection attacks.
     sqlite3_bind_text(stmt, 1, filename, -1, SQLITE_STATIC);
     
     // 4. Iterate over query results
+    // Loop through each row returned by the SQL query (i.e., each sharing peer)
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        // Retrieve data from columns (0-based index)
+        // Retrieve data from columns (0-based index: 0=client_id, 1=ip_address, 2=port)
         uint32_t client_id = (uint32_t)sqlite3_column_int(stmt, 0);
         const char *ip_address = (const char *)sqlite3_column_text(stmt, 1);
         int port = sqlite3_column_int(stmt, 2);
         
+        // Append the peer information to the response buffer.
         // Format: <ClientID> <IP Address> <P2P Port>\r\n
         int added = snprintf(response + len, sizeof(response) - len, 
                              "%u %s %d\r\n", 
@@ -487,32 +491,35 @@ void handle_search(Session *session, const char *filename) {
                              ip_address, 
                              port);
         
-        // Check for buffer overflow before updating length
+        // Check for buffer overflow to ensure we don't write past the buffer limit
         if (len + added >= sizeof(response)) {
-            fprintf(stderr, "[WARNING] Search result buffer exceeded size for file '%s'\n", filename);
-            break; // Stop if buffer is full
+            fprintf(stderr, "[WARNING] Search result buffer exceeded size for file '%s'. Truncating list.\n", filename);
+            break; // Stop iterating if buffer is full
         }
         
-        len += added;
-        file_found = 1;
+        len += added; // Update the current length of the response buffer
+        file_found = 1; // Mark the flag as true since at least one result was found
     }
 
-    // Clean up the prepared statement
+    // Clean up the prepared statement resources
     sqlite3_finalize(stmt);
+    // Release the database lock
     pthread_mutex_unlock(&db_mutex);
 
     // 5. Send results back to the client
     if (file_found) {
-        // Add list termination line: ".\r\n"
+        // Add the list termination line: ".\r\n"
         len += snprintf(response + len, sizeof(response) - len, ".\r\n");
-        // Send the entire buffer (210 + Peer List + termination '.')
+        
+        // Send the complete response (210 + Peer List + termination '.')
         if (send(session->socket_fd, response, len, 0) < 0) {
-             perror("[ERROR] Failed to send search results");
+            perror("[ERROR] Failed to send search results");
         }
         printf("[INFO] Sent search results for file '%s' (Total peers: %d)\n", filename, file_found);
     } else {
-        // Send error if file not found
+        // If no rows were found, send the 'Not Found' error code
         send_response(session->socket_fd, "404\r\n"); // 404: File not found
+        printf("[INFO] File '%s' not found. Sent 404.\n", filename);
     }
 }
 
