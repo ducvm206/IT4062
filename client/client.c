@@ -26,7 +26,7 @@
 #define BUFF_SIZE 8192
 #define MAX_SHARED_FILES 256
 #define MAX_PEERS 128
-#define BUFFER_SIZE BUFF_SIZE  // Add this for consistency
+#define BUFFER_SIZE BUFF_SIZE
 
 // =============================================================================
 // STRUCTURES AND TYPE DEFINITIONS
@@ -119,6 +119,10 @@ void print_response_message(const char *response) {
     else if (strncmp(response, "300", 3) == 0) {
         printf("[ERROR] Invalid message format\n");
     }
+    else if (strncmp(response, "301", 3) == 0) {
+        // Custom code for Invalid port number (Server sends this)
+        printf("[ERROR] Invalid port number\n");
+    }
     // 4xx: Client errors
     else if (strncmp(response, "400", 3) == 0) {
         printf("[ERROR] Username already exists or invalid password\n");
@@ -135,6 +139,9 @@ void print_response_message(const char *response) {
     else if (strncmp(response, "404", 3) == 0) {
         printf("[ERROR] File not found\n");
     }
+    else if (strncmp(response, "405", 3) == 0) {
+        printf("[ERROR] Client ID already exists\n");
+    }
     // 5xx: Server errors
     else if (strncmp(response, "500", 3) == 0) {
         printf("[ERROR] Server error\n");
@@ -149,7 +156,6 @@ void print_response_message(const char *response) {
 // =============================================================================
 
 // Initialize client state
-// Sets default values for client state variables
 void init_client_state() {
     memset(&g_client, 0, sizeof(ClientState));          
     g_client.p2p_port = P2P_PORT;
@@ -161,23 +167,19 @@ void init_client_state() {
 
 // Load shared files from index.txt
 int load_shared_files() {
-    // Open index.txt for reading
+    // Implementation remains the same as it handles local file index.txt
     FILE *fp = fopen("index.txt", "r");
     if (!fp) {
         printf("[INFO] index.txt not found, no files to share\n");
         return 0;
     }
     
-    // Initialize shared files list
     g_shared_files.count = 0;
     char line[768];
 
-    // Read each line and parse file info
     while (fgets(line, sizeof(line), fp) && g_shared_files.count < MAX_SHARED_FILES) {
-        // Remove newline
         line[strcspn(line, "\r\n")] = 0;
         
-        // Parse line: filename|filepath
         char *token = strtok(line, "|");
         if (token) {
             strncpy(g_shared_files.files[g_shared_files.count].filename, token, 255);
@@ -189,7 +191,6 @@ int load_shared_files() {
         }
     }
 
-    // Close the file after reading
     fclose(fp);
     printf("[INFO] Loaded %d shared files from index.txt\n", g_shared_files.count);
     return g_shared_files.count;
@@ -200,22 +201,20 @@ int load_shared_files() {
 // =============================================================================
 
 // Load client ID from config.txt file
-// Returns: 1 if successful, 0 if not found
 int load_client_id(uint32_t *client_id) {
+    // Implementation remains the same
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
-        return 0;  // File doesn't exist
+        return 0; 
     }
     
     char line[256];
     *client_id = 0;
     
-    // Read each line looking for "ClientID="
     while (fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\r\n")] = 0;  // Remove newline
+        line[strcspn(line, "\r\n")] = 0;
         
         if (strncmp(line, "ClientID=", 9) == 0) {
-            // Parse the ClientID value
             *client_id = strtoul(line + 9, NULL, 10);
             fclose(fp);
             return 1;
@@ -223,18 +222,17 @@ int load_client_id(uint32_t *client_id) {
     }
     
     fclose(fp);
-    return 0;  // ClientID not found
+    return 0;
 }
 
 // Save client ID to config.txt file
-// Returns: 1 if successful, 0 on error
 int save_client_id(uint32_t client_id) {
+    // Implementation remains the same
     FILE *fp = fopen(CONFIG_FILE, "w");
     if (!fp) {
         return 0;
     }
     
-    // Write ClientID to file
     fprintf(fp, "ClientID=%u\n", client_id);
     fclose(fp);
     return 1;
@@ -247,11 +245,12 @@ uint32_t generate_client_id() {
 }
 
 // =============================================================================
-// SENDINFO HANDLING
+// SOCKET I/O UTILITY FUNCTIONS
 // =============================================================================
 
 // Send all data in buffer to socket
 ssize_t send_all(int sock, const char *buf, size_t len) {
+    // Implementation remains the same
     size_t total = 0;
     while (total < len) {
         ssize_t sent = send(sock, buf + total, len - total, 0);
@@ -263,136 +262,9 @@ ssize_t send_all(int sock, const char *buf, size_t len) {
     return (ssize_t)total;
 }
 
-// Send command and wait for response
-int send_command(int sock, const char *cmd, char *response, int resp_size) {
-    // Send command
-    if (send_all(sock, cmd, strlen(cmd)) < 0) {
-        perror("[ERROR] Failed to send command");
-        return -1;
-    }
-    
-    // Read response line (simple version)
-    int total = 0;
-    while (total < resp_size - 1) {
-        int bytes = recv(sock, response + total, resp_size - total - 1, 0);
-        if (bytes <= 0) {
-            return -1;  // Connection closed or error
-        }
-        total += bytes;
-        response[total] = '\0';
-        
-        // Check if we have complete response with \r\n
-        if (total >= 2 && response[total-2] == '\r' && response[total-1] == '\n') {
-            response[total-2] = '\0'; // Remove \r\n
-            return total;
-        }
-    }
-    return -1;
-}
-
-int handle_sendinfo(int sock) {
-    if (!g_client.is_logged_in) {
-        printf("[ERROR] Must login first\n");
-        return -1;
-    }
-    
-    // Validate ClientID
-    if (g_client.client_id == 0) {
-        printf("[ERROR] Invalid ClientID\n");
-        return -1;
-    }
-    
-    // Validate P2P port
-    if (g_client.p2p_port < 1024 || g_client.p2p_port > 65535) {
-        printf("[ERROR] Invalid P2P port: %d\n", g_client.p2p_port);
-        return -1;
-    }
-    
-    char command[256];
-    char response[BUFF_SIZE];
-    
-    // Build SENDINFO command
-    snprintf(command, sizeof(command), "SENDINFO %u %d\r\n", 
-             g_client.client_id, g_client.p2p_port);
-    
-    printf("[INFO] Sending client info: ID=%u, Port=%d\n", 
-           g_client.client_id, g_client.p2p_port);
-    
-    // Send command and get response
-    if (send_command(sock, command, response, sizeof(response)) <= 0) {
-        printf("[ERROR] Failed to send/receive SENDINFO\n");
-        return -1;
-    }
-    
-    // Parse response
-    if (strcmp(response, "103") == 0) {
-        printf("[SUCCESS] Client info registered with server\n");
-        printf("[INFO] Other clients can now connect to you at port %d\n", g_client.p2p_port);
-        return 0;
-    } 
-    else if (strcmp(response, "403") == 0) {
-        printf("[ERROR] Not logged in - please login first\n");
-        return -1;
-    }
-    else if (strcmp(response, "405") == 0) {
-        printf("[ERROR] Client ID already in use by another account\n");
-        return -1;
-    }
-    else if (strcmp(response, "301") == 0) {
-        printf("[ERROR] Invalid port number\n");
-        return -1;
-    }
-    else {
-        printf("[ERROR] Server response: %s\n", response);
-        return -1;
-    }
-}
-
-// =============================================================================
-// SERVER CONNECTION
-// =============================================================================
-
-int connect_to_server(const char *server_ip, int server_port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("[ERROR] Cannot create socket");
-        return -1;
-    }
-    
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(server_port);
-    
-    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
-        perror("[ERROR] Invalid server IP address");
-        close(sock);
-        return -1;
-    }
-    
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("[ERROR] Cannot connect to server");
-        close(sock);
-        return -1;
-    }
-    
-    printf("[INFO] Connected to server %s:%d\n", server_ip, server_port);
-    return sock;
-}
-
-void disconnect_from_server(int sock) {
-    if (sock >= 0) {
-        close(sock);
-        printf("[INFO] Disconnected from server\n");
-    }
-}
-
-// =============================================================================
-// LINE-BY-LINE MESSAGE PROCESSING FUNCTIONS (FOR OTHER COMMANDS)
-// =============================================================================
-
-// Find \r\n in buffer
+// Find \r\n in buffer (Used by read_line)
 ssize_t find_crlf(const char *buf, size_t len) {
+    // Implementation remains the same
     if (len < 2) return -1;
     for (size_t i = 0; i + 1 < len; ++i) {
         if (buf[i] == '\r' && buf[i + 1] == '\n')
@@ -401,8 +273,9 @@ ssize_t find_crlf(const char *buf, size_t len) {
     return -1;
 }
 
-// Read a complete line ending with \r\n from socket (for other commands)
+// Read a complete line ending with \r\n from socket
 int read_line(int sock, char *line, int line_size) {
+    // Implementation remains the same (important for robust line reading)
     static char buffer[BUFF_SIZE];
     static int buffer_pos = 0;
     
@@ -431,7 +304,7 @@ int read_line(int sock, char *line, int line_size) {
     // Read more data
     int max_read = sizeof(buffer) - buffer_pos - 1;
     if (max_read <= 0) {
-        fprintf(stderr, "[ERROR] Buffer full\n");
+        fprintf(stderr, "[ERROR] Internal buffer full\n");
         return -1;
     }
     
@@ -456,6 +329,189 @@ int read_line(int sock, char *line, int line_size) {
     return read_line(sock, line, line_size);
 }
 
+// Send command and wait for response (reads only the first line/status code)
+// NOTE: This version is only for simple command/status responses (e.g., LOGIN, SENDINFO)
+// For multi-line responses (e.g., SEARCH), use read_line directly.
+int send_command(int sock, const char *cmd, char *response, int resp_size) {
+    // 1. Send command
+    if (send_all(sock, cmd, strlen(cmd)) < 0) {
+        perror("[ERROR] Failed to send command");
+        return -1;
+    }
+    
+    // 2. Read the first line response
+    int read_status = read_line(sock, response, resp_size);
+    
+    if (read_status < 0) {
+        // Connection closed or buffer error
+        return -1;
+    } else if (read_status == 0) {
+        // No data available (shouldn't happen in synchronous command mode)
+        return -1;
+    }
+    
+    // Success: response contains the status code line
+    return 0;
+}
+
+// =============================================================================
+// COMMAND HANDLING
+// =============================================================================
+
+// Handle SENDINFO command: send ClientID and P2P port to server
+int handle_sendinfo(int sock) {
+    if (!g_client.is_logged_in) {
+        print_response_message("403"); // User not logged in
+        return -1;
+    }
+    
+    // Validation checks
+    if (g_client.client_id == 0) {
+        printf("[ERROR] Invalid ClientID\n");
+        return -1;
+    }
+    if (g_client.p2p_port < 1024 || g_client.p2p_port > 65535) {
+        printf("[ERROR] Invalid P2P port: %d\n", g_client.p2p_port);
+        return -1;
+    }
+    
+    char command[256];
+    char response[BUFF_SIZE];
+    
+    // Build SENDINFO command: SENDINFO <ClientID> <Port>\r\n
+    snprintf(command, sizeof(command), "SENDINFO %u %d\r\n", 
+             g_client.client_id, g_client.p2p_port);
+    
+    printf("[INFO] Sending client info: ID=%u, Port=%d\n", 
+           g_client.client_id, g_client.p2p_port);
+    
+    // Send command and get response
+    if (send_command(sock, command, response, sizeof(response)) < 0) {
+        printf("[ERROR] Failed to send/receive SENDINFO command\n");
+        return -1;
+    }
+    
+    // Display result using the response message printer
+    print_response_message(response);
+
+    // Return status based on the response code
+    if (strcmp(response, "103") == 0) {
+        return 0; // Success
+    } else {
+        return -1; // Failure
+    }
+}
+
+// Handle SEARCH command: search for a file and populate peer list
+// Returns: Number of peers found (>= 0), or -1 if command failed.
+int handle_search(int sock, const char *filename, PeerInfo peers_out[], int max_peers) {
+    if (!g_client.is_logged_in) {
+        print_response_message("403"); // Not logged in
+        return -1; 
+    }
+    
+    char command[512];
+    char line[BUFF_SIZE];
+    
+    // 1. Send SEARCH command
+    snprintf(command, sizeof(command), "SEARCH %s\r\n", filename);
+    if (send_all(sock, command, strlen(command)) < 0) {
+        perror("[ERROR] Failed to send SEARCH command");
+        return -1;
+    }
+    
+    // 2. Read the initial response (Status code: 210, 404, etc.)
+    int read_status = read_line(sock, line, sizeof(line));
+    
+    if (read_status <= 0) {
+        // Connection error or closed
+        return -1;
+    }
+
+    // Display initial status
+    print_response_message(line);
+    
+    // Check for success code '210'
+    if (strcmp(line, "210") != 0) {
+        // Command failed (e.g., 404 File not found)
+        return 0; 
+    }
+    
+    // 3. Read list of peers until termination line "."
+    int peer_count = 0;
+    while (peer_count < max_peers) {
+        // Note: read_line returns 1 on success, 0 on no data (shouldn't happen here), -1 on error
+        if (read_line(sock, line, sizeof(line)) != 1) { 
+            // Connection error during list reading
+            return -1; 
+        }
+        
+        // Check for list termination line "."
+        if (strcmp(line, ".") == 0) {
+            break;
+        }
+        
+        PeerInfo current_peer;
+        
+        // Parse peer info: <ClientID> <IP Address> <P2P Port>
+        if (sscanf(line, "%u %15s %d", 
+                   &current_peer.client_id, 
+                   current_peer.ip_address, 
+                   &current_peer.port) == 3) {
+            
+            // Store successful peer info
+            peers_out[peer_count] = current_peer;
+            peer_count++;
+        } else {
+            fprintf(stderr, "[WARNING] Invalid peer format received: %s\n", line);
+        }
+    }
+    
+    return peer_count; // Return the number of peers found
+}
+
+// =============================================================================
+// SERVER CONNECTION
+// =============================================================================
+
+// Connect to the main server
+int connect_to_server(const char *server_ip, int server_port) {
+    // Implementation remains the same
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("[ERROR] Cannot create socket");
+        return -1;
+    }
+    
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    
+    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
+        perror("[ERROR] Invalid server IP address");
+        close(sock);
+        return -1;
+    }
+    
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("[ERROR] Cannot connect to server");
+        close(sock);
+        return -1;
+    }
+    
+    printf("[INFO] Connected to server %s:%d\n", server_ip, server_port);
+    return sock;
+}
+
+// Disconnect from the main server
+void disconnect_from_server(int sock) {
+    if (sock >= 0) {
+        close(sock);
+        printf("[INFO] Disconnected from server\n");
+    }
+}
+
 // =============================================================================
 // DEMONSTRATION MAIN FUNCTION
 // =============================================================================
@@ -466,7 +522,6 @@ int main(int argc, char *argv[]) {
     
     // Load or generate ClientID
     if (!load_client_id(&g_client.client_id)) {
-        // If not found, generate new ClientID
         g_client.client_id = generate_client_id();
         if (!save_client_id(g_client.client_id)) {
             printf("[ERROR] Cannot save client ID to config.txt\n");
@@ -484,6 +539,10 @@ int main(int argc, char *argv[]) {
     printf("[INFO] Client ID: %u\n", g_client.client_id);
     printf("[INFO] P2P Port: %d\n", g_client.p2p_port);
     printf("[INFO] Shared files: %d\n", g_shared_files.count);
+    
+    // --- DEMO USAGE ---
+    // The rest of the main function should contain demo logic for connect, 
+    // login, sendinfo, publish, search, etc., which is not fully provided here.
     
     return 0;
 }

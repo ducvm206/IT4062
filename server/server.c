@@ -68,6 +68,8 @@ typedef struct
 
 
 
+
+
 /* =============================================================================
    GLOBAL VARIABLES
    ============================================================================= */
@@ -131,6 +133,7 @@ void send_response(int socket_fd, const char *response)
 //   buf: Buffer to search
 //   len: Length of data in buffer
 // Returns: Index of '\r' if found, -1 if not found
+
 ssize_t find_crlf(const char *buf, size_t len)
 {
     if (len < 2)
@@ -431,12 +434,93 @@ void handle_sendinfo(Session *session, uint32_t client_id, int port) {
            session->account_id, client_id, client_ip, port);
 }
 
+// Handle SEARCH command from client
+// Command format: SEARCH <Filename>
+void handle_search(Session *session, const char *filename) {
+    // 1. Check login status
+    if (!session->is_logged_in) {
+        send_response(session->socket_fd, "403\r\n"); // 403: User not logged in
+        return;
+    }
+
+    // 2. Prepare response buffer
+    // Buffer is sized to hold status code 210, the list of peers (IP/Port), and the termination line '.'.
+    char response[BUFF_SIZE * 2]; 
+    int len = snprintf(response, sizeof(response), "210\r\n"); // 210: File found (start list)
+    int file_found = 0;
+
+    // 3. Prepare and execute SQL query
+    sqlite3_stmt *stmt;
+    const char *tail;
+    
+    // QUERY: Select DISTINCT ClientID, IP, and Port from the clients table for all files matching the filename.
+    const char *query = 
+        "SELECT DISTINCT c.client_id, c.ip_address, c.port "
+        "FROM files f "
+        "JOIN clients c ON f.client_id = c.client_id "
+        "WHERE f.filename = ?;"; // Use '?' to safely bind the filename parameter
+        
+    pthread_mutex_lock(&db_mutex);
+
+    int rc = sqlite3_prepare_v2(db, query, -1, &stmt, &tail);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[ERROR] SQL error on SEARCH prepare: %s\n", sqlite3_errmsg(db));
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n"); // 500: Internal server error
+        return;
+    }
+    
+    // Bind filename to the placeholder (?) to prevent SQL Injection
+    sqlite3_bind_text(stmt, 1, filename, -1, SQLITE_STATIC);
+    
+    // 4. Iterate over query results
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        // Retrieve data from columns (0-based index)
+        uint32_t client_id = (uint32_t)sqlite3_column_int(stmt, 0);
+        const char *ip_address = (const char *)sqlite3_column_text(stmt, 1);
+        int port = sqlite3_column_int(stmt, 2);
+        
+        // Format: <ClientID> <IP Address> <P2P Port>\r\n
+        int added = snprintf(response + len, sizeof(response) - len, 
+                             "%u %s %d\r\n", 
+                             client_id, 
+                             ip_address, 
+                             port);
+        
+        // Check for buffer overflow before updating length
+        if (len + added >= sizeof(response)) {
+            fprintf(stderr, "[WARNING] Search result buffer exceeded size for file '%s'\n", filename);
+            break; // Stop if buffer is full
+        }
+        
+        len += added;
+        file_found = 1;
+    }
+
+    // Clean up the prepared statement
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&db_mutex);
+
+    // 5. Send results back to the client
+    if (file_found) {
+        // Add list termination line: ".\r\n"
+        len += snprintf(response + len, sizeof(response) - len, ".\r\n");
+        // Send the entire buffer (210 + Peer List + termination '.')
+        if (send(session->socket_fd, response, len, 0) < 0) {
+             perror("[ERROR] Failed to send search results");
+        }
+        printf("[INFO] Sent search results for file '%s' (Total peers: %d)\n", filename, file_found);
+    } else {
+        // Send error if file not found
+        send_response(session->socket_fd, "404\r\n"); // 404: File not found
+    }
+}
+
 // Headers for unfinished use cases
 void handle_register(Session *session, const char *username, const char *password);
 void handle_login(Session *session, const char *username, const char *password);
 void handle_publish(Session *session, uint32_t client_id, const char *filename);
 void handle_unpublish(Session *session, const char *filename);
-void handle_search(Session *session, const char *filename);
 void handle_logout(Session *session);
 
 // Process a single client request line
@@ -718,7 +802,7 @@ int init_server_socket()
 // Returns: New socket file descriptor for client communication, -1 on error
 int accept_client_connection(int listenfd, struct sockaddr_in *client_addr, socklen_t *sin_size)
 {
-    int new_sock = accept(listenfd, (struct sockaddr *)client_addr, sin_size);
+    int new_sock = accept(listenfd, (struct sockaddr *)client_addr, *sin_size);
     
     if (new_sock == -1)
     {
