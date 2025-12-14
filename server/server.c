@@ -11,7 +11,7 @@
 #include <errno.h>
 #include <time.h>
 #include <pthread.h>
-#include <sqlite3.h>
+#include <mysql/mysql.h>
 #include <openssl/sha.h>
 #include <arpa/inet.h>
 
@@ -26,8 +26,14 @@
 #define MAX_TOTAL_FILES 4096         // Maximum number of files in the index
 #define BACKLOG 20                   // Maximum pending connections in listen queue
 #define INDEX_FILE "index.txt"       // File name for storing the file index
-#define DATABASE_FILE "database"    // SQLite database file for account management
 #define PASSWORD_HASH_LENGTH 65      // Length of SHA256 hex string + null terminator
+
+// MySQL connection parameters
+#define MYSQL_HOST "localhost"       // MySQL server host
+#define MYSQL_USER "root"            // MySQL username
+#define MYSQL_PASSWORD "123456"      // MySQL password (empty by default)
+#define MYSQL_DATABASE "p2p_db"      // MySQL database name
+#define MYSQL_PORT 3306              // MySQL port
 
 /* =============================================================================
    STRUCTS
@@ -36,6 +42,7 @@
 // Structure for session information
 typedef struct
 {
+    uint32_t client_id;
     int socket_fd;                  // Socket file descriptor of client
     struct sockaddr_in client_addr; // Client connection address information
     int account_id;                 // User ID from database, -1 if not logged in
@@ -80,7 +87,7 @@ pthread_mutex_t session_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Client information management - stores P2P connection details from SENDINFO
 ClientInfo client_infos[MAX_CLIENTS];
-int client_info_count = 0;
+int client_info_count = 0; 
 pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // File index management - in-memory cache of shared files loaded from index.txt
@@ -89,7 +96,7 @@ int file_index_count = 0;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Database connection for account authentication and management
-sqlite3 *db = NULL;
+MYSQL *db = NULL;
 pthread_mutex_t db_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* =============================================================================
@@ -150,36 +157,88 @@ ssize_t find_crlf(const char *buf, size_t len)
    DATABASE OPERATIONS
    ============================================================================= */
 
-// Initialize SQLite database connection and create accounts table if needed
+// Initialize MySQL database connection and create tables if needed
 // Returns: 0 on success, -1 on failure
 int init_database()
 {
-    int rc = sqlite3_open(DATABASE_FILE, &db);
-    if (rc != SQLITE_OK)
+    // Initialize MySQL connection
+    db = mysql_init(NULL);
+    if (db == NULL)
     {
-        fprintf(stderr, "[ERROR] Cannot open database: %s\n", sqlite3_errmsg(db));
+        fprintf(stderr, "[ERROR] Cannot initialize MySQL: %s\n", mysql_error(db));
         return -1;
+    }
+    
+    // Connect to MySQL server
+    if (mysql_real_connect(db, MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, 
+                          MYSQL_DATABASE, MYSQL_PORT, NULL, 0) == NULL)
+    {
+        fprintf(stderr, "[ERROR] Cannot connect to MySQL: %s\n", mysql_error(db));
+        mysql_close(db);
+        db = NULL;
+        return -1;
+    }
+    
+    // Set character set to UTF-8
+    if (mysql_set_character_set(db, "utf8mb4") != 0)
+    {
+        fprintf(stderr, "[WARNING] Cannot set character set: %s\n", mysql_error(db));
     }
     
     // Create accounts table with required schema
-    char *err_msg = NULL;
-    const char *create_table_sql = 
+    const char *create_accounts_sql = 
         "CREATE TABLE IF NOT EXISTS accounts ("
-        "account_id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "username TEXT NOT NULL UNIQUE,"
-        "password_hash TEXT NOT NULL,"
+        "account_id INT AUTO_INCREMENT PRIMARY KEY,"
+        "username VARCHAR(64) NOT NULL UNIQUE,"
+        "password_hash VARCHAR(65) NOT NULL,"
         "created_at DATETIME DEFAULT CURRENT_TIMESTAMP"
-        ");";
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
     
-    rc = sqlite3_exec(db, create_table_sql, NULL, NULL, &err_msg);
-    if (rc != SQLITE_OK)
+    if (mysql_query(db, create_accounts_sql) != 0)
     {
-        fprintf(stderr, "[ERROR] Failed to create table: %s\n", err_msg);
-        sqlite3_free(err_msg);
+        fprintf(stderr, "[ERROR] Failed to create accounts table: %s\n", mysql_error(db));
+        mysql_close(db);
+        db = NULL;
         return -1;
     }
     
-    printf("[INFO] Accounts database initialized\n");
+    // Create clients table
+    const char *create_clients_sql = 
+        "CREATE TABLE IF NOT EXISTS clients ("
+        "client_id INT UNSIGNED PRIMARY KEY,"
+        "account_id INT NOT NULL,"
+        "ip_address VARCHAR(15) NOT NULL,"
+        "port INT NOT NULL,"
+        "last_seen DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+        "FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+    
+    if (mysql_query(db, create_clients_sql) != 0)
+    {
+        fprintf(stderr, "[ERROR] Failed to create clients table: %s\n", mysql_error(db));
+        // Continue anyway, table might already exist
+    }
+    
+    // Create files table
+    const char *create_files_sql = 
+        "CREATE TABLE IF NOT EXISTS files ("
+        "file_id INT AUTO_INCREMENT PRIMARY KEY,"
+        "client_id INT UNSIGNED NOT NULL,"
+        "filename VARCHAR(255) NOT NULL,"
+        "filesize BIGINT NOT NULL,"
+        "published_at DATETIME DEFAULT CURRENT_TIMESTAMP,"
+        "FOREIGN KEY (client_id) REFERENCES clients(client_id) ON DELETE CASCADE,"
+        "INDEX idx_files_filename (filename)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+    
+    if (mysql_query(db, create_files_sql) != 0)
+    {
+        fprintf(stderr, "[ERROR] Failed to create files table: %s\n", mysql_error(db));
+        // Continue anyway, table might already exist
+    }
+    
+    printf("[INFO] MySQL database initialized successfully\n");
+    printf("[INFO] Connected to database: %s@%s/%s\n", MYSQL_USER, MYSQL_HOST, MYSQL_DATABASE);
     return 0;
 }
 
@@ -450,8 +509,7 @@ void handle_search(Session *session, const char *filename) {
     int file_found = 0;
 
     // 3. Prepare and execute SQL query
-    sqlite3_stmt *stmt;
-    const char *tail;
+    MYSQL_STMT *stmt;
     
     // QUERY: Select DISTINCT ClientID, IP, and Port from the clients table for all files matching the filename.
     const char *query = 
@@ -462,23 +520,90 @@ void handle_search(Session *session, const char *filename) {
         
     pthread_mutex_lock(&db_mutex);
 
-    int rc = sqlite3_prepare_v2(db, query, -1, &stmt, &tail);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "[ERROR] SQL error on SEARCH prepare: %s\n", sqlite3_errmsg(db));
+    stmt = mysql_stmt_init(db);
+    if (stmt == NULL) {
+        fprintf(stderr, "[ERROR] SQL error on SEARCH init: %s\n", mysql_error(db));
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n"); // 500: Internal server error
+        return;
+    }
+
+    if (mysql_stmt_prepare(stmt, query, strlen(query)) != 0) {
+        fprintf(stderr, "[ERROR] SQL error on SEARCH prepare: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n"); // 500: Internal server error
         return;
     }
     
     // Bind filename to the placeholder (?) to prevent SQL Injection
-    sqlite3_bind_text(stmt, 1, filename, -1, SQLITE_STATIC);
+    MYSQL_BIND bind_param;
+    memset(&bind_param, 0, sizeof(bind_param));
+    unsigned long filename_len = strlen(filename);
+    bind_param.buffer_type = MYSQL_TYPE_STRING;
+    bind_param.buffer = (char *)filename;
+    bind_param.buffer_length = filename_len;
+    bind_param.length = &filename_len;
+    
+    if (mysql_stmt_bind_param(stmt, &bind_param) != 0) {
+        fprintf(stderr, "[ERROR] SQL error on SEARCH bind: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Execute query
+    if (mysql_stmt_execute(stmt) != 0) {
+        fprintf(stderr, "[ERROR] SQL error on SEARCH execute: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Bind result columns
+    uint32_t client_id;
+    char ip_address[16];
+    int port;
+    unsigned long ip_len;
+    my_bool is_null[3];
+    my_bool error[3];
+    
+    MYSQL_BIND bind_result[3];
+    memset(bind_result, 0, sizeof(bind_result));
+    
+    bind_result[0].buffer_type = MYSQL_TYPE_LONG;
+    bind_result[0].buffer = &client_id;
+    bind_result[0].is_null = &is_null[0];
+    bind_result[0].error = &error[0];
+    
+    bind_result[1].buffer_type = MYSQL_TYPE_STRING;
+    bind_result[1].buffer = ip_address;
+    bind_result[1].buffer_length = sizeof(ip_address) - 1;
+    bind_result[1].length = &ip_len;
+    bind_result[1].is_null = &is_null[1];
+    bind_result[1].error = &error[1];
+    
+    bind_result[2].buffer_type = MYSQL_TYPE_LONG;
+    bind_result[2].buffer = &port;
+    bind_result[2].is_null = &is_null[2];
+    bind_result[2].error = &error[2];
+    
+    if (mysql_stmt_bind_result(stmt, bind_result) != 0) {
+        fprintf(stderr, "[ERROR] SQL error on SEARCH bind result: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Store result
+    mysql_stmt_store_result(stmt);
     
     // 4. Iterate over query results
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        // Retrieve data from columns (0-based index)
-        uint32_t client_id = (uint32_t)sqlite3_column_int(stmt, 0);
-        const char *ip_address = (const char *)sqlite3_column_text(stmt, 1);
-        int port = sqlite3_column_int(stmt, 2);
+    while (mysql_stmt_fetch(stmt) == 0) {
+        ip_address[ip_len] = '\0';
         
         // Format: <ClientID> <IP Address> <P2P Port>\r\n
         int added = snprintf(response + len, sizeof(response) - len, 
@@ -498,7 +623,7 @@ void handle_search(Session *session, const char *filename) {
     }
 
     // Clean up the prepared statement
-    sqlite3_finalize(stmt);
+    mysql_stmt_close(stmt);
     pthread_mutex_unlock(&db_mutex);
 
     // 5. Send results back to the client
@@ -516,9 +641,314 @@ void handle_search(Session *session, const char *filename) {
     }
 }
 
-// Headers for unfinished use cases
-void handle_register(Session *session, const char *username, const char *password);
-void handle_login(Session *session, const char *username, const char *password);
+// Handle REGISTER command from client
+// Command format: REGISTER username password
+// Response codes:
+//   101: Đăng ký thành công
+//   400: Username đã tồn tại hoặc password < 6 ký tự
+//   300: Không xác định được kiểu thông điệp (đã được xử lý ở process_request)
+void handle_register(Session *session, const char *username, const char *password)
+{
+    // 1. Kiểm tra độ dài password (tối thiểu 6 ký tự)
+    if (strlen(password) < 6)
+    {
+        send_response(session->socket_fd, "400\r\n");
+        return;
+    }
+    
+    // 2. Kiểm tra username đã tồn tại chưa
+    pthread_mutex_lock(&db_mutex);
+    
+    MYSQL_STMT *stmt = mysql_stmt_init(db);
+    if (stmt == NULL)
+    {
+        fprintf(stderr, "[ERROR] Cannot initialize MySQL statement: %s\n", mysql_error(db));
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    const char *check_sql = "SELECT account_id FROM accounts WHERE username = ?;";
+    
+    if (mysql_stmt_prepare(stmt, check_sql, strlen(check_sql)) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER check prepare: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Bind username parameter
+    MYSQL_BIND bind_param;
+    memset(&bind_param, 0, sizeof(bind_param));
+    bind_param.buffer_type = MYSQL_TYPE_STRING;
+    bind_param.buffer = (char *)username;
+    bind_param.buffer_length = strlen(username);
+    bind_param.length = &bind_param.buffer_length;
+    
+    if (mysql_stmt_bind_param(stmt, &bind_param) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER check bind: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Execute query
+    if (mysql_stmt_execute(stmt) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER check execute: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Store result
+    mysql_stmt_store_result(stmt);
+    
+    // Kiểm tra xem username đã tồn tại chưa
+    if (mysql_stmt_num_rows(stmt) > 0)
+    {
+        // Username đã tồn tại
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "400\r\n");
+        return;
+    }
+    
+    mysql_stmt_close(stmt);
+    
+    // 3. Hash password
+    char password_hash[PASSWORD_HASH_LENGTH];
+    hash_password(password, password_hash);
+    
+    // 4. Insert tài khoản mới vào database
+    stmt = mysql_stmt_init(db);
+    if (stmt == NULL)
+    {
+        fprintf(stderr, "[ERROR] Cannot initialize MySQL statement: %s\n", mysql_error(db));
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    const char *insert_sql = "INSERT INTO accounts (username, password_hash) VALUES (?, ?);";
+    
+    if (mysql_stmt_prepare(stmt, insert_sql, strlen(insert_sql)) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER insert prepare: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Bind parameters
+    MYSQL_BIND bind_params[2];
+    memset(bind_params, 0, sizeof(bind_params));
+    
+    unsigned long username_len = strlen(username);
+    bind_params[0].buffer_type = MYSQL_TYPE_STRING;
+    bind_params[0].buffer = (char *)username;
+    bind_params[0].buffer_length = username_len;
+    bind_params[0].length = &username_len;
+    
+    unsigned long hash_len = strlen(password_hash);
+    bind_params[1].buffer_type = MYSQL_TYPE_STRING;
+    bind_params[1].buffer = password_hash;
+    bind_params[1].buffer_length = hash_len;
+    bind_params[1].length = &hash_len;
+    
+    if (mysql_stmt_bind_param(stmt, bind_params) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER insert bind: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Thực thi insert
+    if (mysql_stmt_execute(stmt) != 0)
+    {
+        // Có thể là lỗi UNIQUE constraint (username đã tồn tại - race condition)
+        unsigned int err_no = mysql_stmt_errno(stmt);
+        if (err_no == 1062) // ER_DUP_ENTRY
+        {
+            fprintf(stderr, "[ERROR] Username already exists: %s\n", username);
+            mysql_stmt_close(stmt);
+            pthread_mutex_unlock(&db_mutex);
+            send_response(session->socket_fd, "400\r\n");
+            return;
+        }
+        fprintf(stderr, "[ERROR] SQL error on REGISTER insert execute: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    mysql_stmt_close(stmt);
+    pthread_mutex_unlock(&db_mutex);
+    
+    // 5. Gửi response thành công
+    send_response(session->socket_fd, "101\r\n");
+    printf("[INFO] New account registered: username=%s\n", username);
+}
+
+// Handle LOGIN command from client
+// Command format: LOGIN username password
+// Response codes:
+//   102: Đăng nhập thành công
+//   401: Tài khoản không tồn tại hoặc sai mật khẩu
+//   300: Không xác định được kiểu thông điệp (đã được xử lý ở process_request)
+void handle_login(Session *session, const char *username, const char *password)
+{
+    // 1. Hash password để so sánh
+    char password_hash[PASSWORD_HASH_LENGTH];
+    hash_password(password, password_hash);
+    
+    // 2. Tìm tài khoản trong database
+    pthread_mutex_lock(&db_mutex);
+    
+    MYSQL_STMT *stmt = mysql_stmt_init(db);
+    if (stmt == NULL)
+    {
+        fprintf(stderr, "[ERROR] Cannot initialize MySQL statement: %s\n", mysql_error(db));
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    const char *query_sql = "SELECT account_id, password_hash FROM accounts WHERE username = ?;";
+    
+    if (mysql_stmt_prepare(stmt, query_sql, strlen(query_sql)) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on LOGIN prepare: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Bind username parameter
+    MYSQL_BIND bind_param;
+    memset(&bind_param, 0, sizeof(bind_param));
+    unsigned long username_len = strlen(username);
+    bind_param.buffer_type = MYSQL_TYPE_STRING;
+    bind_param.buffer = (char *)username;
+    bind_param.buffer_length = username_len;
+    bind_param.length = &username_len;
+    
+    if (mysql_stmt_bind_param(stmt, &bind_param) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on LOGIN bind: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Execute query
+    if (mysql_stmt_execute(stmt) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on LOGIN execute: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Bind result columns
+    int account_id;
+    char stored_hash[PASSWORD_HASH_LENGTH];
+    unsigned long hash_len;
+    my_bool is_null[2];
+    my_bool error[2];
+    
+    MYSQL_BIND bind_result[2];
+    memset(bind_result, 0, sizeof(bind_result));
+    
+    bind_result[0].buffer_type = MYSQL_TYPE_LONG;
+    bind_result[0].buffer = &account_id;
+    bind_result[0].is_null = &is_null[0];
+    bind_result[0].error = &error[0];
+    
+    bind_result[1].buffer_type = MYSQL_TYPE_STRING;
+    bind_result[1].buffer = stored_hash;
+    bind_result[1].buffer_length = sizeof(stored_hash) - 1;
+    bind_result[1].length = &hash_len;
+    bind_result[1].is_null = &is_null[1];
+    bind_result[1].error = &error[1];
+    
+    if (mysql_stmt_bind_result(stmt, bind_result) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on LOGIN bind result: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Store result
+    mysql_stmt_store_result(stmt);
+    
+    // Fetch result
+    int rc = mysql_stmt_fetch(stmt);
+    if (rc == 0)
+    {
+        // Tìm thấy username, so sánh password hash
+        stored_hash[hash_len] = '\0';
+        
+        if (strcmp(password_hash, stored_hash) == 0)
+        {
+            // Mật khẩu đúng - đăng nhập thành công
+            mysql_stmt_close(stmt);
+            pthread_mutex_unlock(&db_mutex);
+            
+            // Cập nhật session
+            pthread_mutex_lock(&session_mutex);
+            session->account_id = account_id;
+            strncpy(session->username, username, sizeof(session->username) - 1);
+            session->username[sizeof(session->username) - 1] = '\0';
+            session->is_logged_in = 1;
+            pthread_mutex_unlock(&session_mutex);
+            
+            // Gửi response thành công
+            send_response(session->socket_fd, "102\r\n");
+            printf("[INFO] User logged in: username=%s, account_id=%d\n", username, account_id);
+            return;
+        }
+        else
+        {
+            // Mật khẩu sai
+            mysql_stmt_close(stmt);
+            pthread_mutex_unlock(&db_mutex);
+            send_response(session->socket_fd, "401\r\n");
+            return;
+        }
+    }
+    else if (rc == MYSQL_NO_DATA)
+    {
+        // Không tìm thấy username
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "401\r\n");
+        return;
+    }
+    else
+    {
+        // Lỗi SQL
+        fprintf(stderr, "[ERROR] SQL error on LOGIN fetch: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+}
 void handle_publish(Session *session, uint32_t client_id, const char *filename);
 void handle_unpublish(Session *session, const char *filename);
 void handle_logout(Session *session);
@@ -839,13 +1269,13 @@ int main()
     int listenfd = init_server_socket();
     if (listenfd == -1)
     {
-        sqlite3_close(db);
+        mysql_close(db);
         return EXIT_FAILURE;
     }
     
     printf("[INFO] Server starting\n");
     printf("[INFO] File index stored in: %s\n", INDEX_FILE);
-    printf("[INFO] Accounts stored in: %s\n", DATABASE_FILE);
+    printf("[INFO] Database: MySQL (%s@%s/%s)\n", MYSQL_USER, MYSQL_HOST, MYSQL_DATABASE);
     
     // Initialize data structures
     memset(sessions, 0, sizeof(sessions));
@@ -923,6 +1353,6 @@ int main()
     
     // Cleanup (unreachable in normal operation)
     close(listenfd);
-    sqlite3_close(db);
+    mysql_close(db);
     return 0;
 }
