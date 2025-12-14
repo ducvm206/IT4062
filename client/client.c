@@ -196,6 +196,19 @@ int load_shared_files() {
     return g_shared_files.count;
 }
 
+// Extract status code integer from response string
+int get_status_code(const char *response) {
+    if (response == NULL || strlen(response) < 3) {
+        return 0; // Invalid response
+    }
+    // Check if the first three characters are digits
+    if (isdigit(response[0]) && isdigit(response[1]) && isdigit(response[2])) {
+        // Convert the status code part to integer
+        return atoi(response);
+    }
+    return 0;
+}
+
 // =============================================================================
 // CONFIG FILE MANAGEMENT FUNCTIONS
 // =============================================================================
@@ -360,45 +373,35 @@ int send_command(int sock, const char *cmd, char *response, int resp_size) {
 
 // Handle SENDINFO command: send ClientID and P2P port to server
 int handle_sendinfo(int sock) {
-    if (!g_client.is_logged_in) {
-        print_response_message("403"); // User not logged in
-        return -1;
-    }
-    
-    // Validation checks
-    if (g_client.client_id == 0) {
-        printf("[ERROR] Invalid ClientID\n");
-        return -1;
-    }
-    if (g_client.p2p_port < 1024 || g_client.p2p_port > 65535) {
-        printf("[ERROR] Invalid P2P port: %d\n", g_client.p2p_port);
-        return -1;
-    }
-    
-    char command[256];
+    char command[512];
     char response[BUFF_SIZE];
+    int status_code;
     
-    // Build SENDINFO command: SENDINFO <ClientID> <Port>\r\n
+    // Check if the user is logged in
+    if (!g_client.is_logged_in) {
+        // If not logged in, server should reject this, but client-side check is safer.
+        return -1; 
+    }
+
+    // 1. Construct the SENDINFO command string
     snprintf(command, sizeof(command), "SENDINFO %u %d\r\n", 
              g_client.client_id, g_client.p2p_port);
     
-    printf("[INFO] Sending client info: ID=%u, Port=%d\n", 
-           g_client.client_id, g_client.p2p_port);
-    
-    // Send command and get response
+    // 2. Send command and wait for status response
     if (send_command(sock, command, response, sizeof(response)) < 0) {
-        printf("[ERROR] Failed to send/receive SENDINFO command\n");
+        perror("[ERROR] Failed to send SENDINFO command or receive response");
         return -1;
     }
     
-    // Display result using the response message printer
+    // 3. Print server response (using the dedicated function)
     print_response_message(response);
-
-    // Return status based on the response code
-    if (strcmp(response, "103") == 0) {
-        return 0; // Success
+    status_code = get_status_code(response);
+    
+    if (status_code == 103) {
+        return 0; // Success (Server status code 103 handles success message)
     } else {
-        return -1; // Failure
+        // Failure (Server status codes like 405 handle error messages)
+        return -1; 
     }
 }
 
@@ -470,6 +473,82 @@ int handle_search(int sock, const char *filename, PeerInfo peers_out[], int max_
     return peer_count; // Return the number of peers found
 }
 
+// Handle REGISTER command: register a new user
+// Returns: 0 on success, -1 on failure
+int handle_register(int sock, const char *username, const char *password) {
+    char command[512];
+    char response[BUFF_SIZE];
+    int status_code;
+    
+    // Check if the user is already logged in (Prevent unnecessary request)
+    if (g_client.is_logged_in) {
+        // Warning relies on server message/logic. Returning failure to register.
+        // If server allows re-registration (which it shouldn't), the server response handles the status.
+        return -1; 
+    }
+
+    // 1. Construct the REGISTER command string
+    snprintf(command, sizeof(command), "REGISTER %s %s\r\n", username, password);
+    
+    // 2. Send command and wait for status response
+    if (send_command(sock, command, response, sizeof(response)) < 0) {
+        perror("[ERROR] Failed to send REGISTER command or receive response");
+        return -1;
+    }
+    
+    // 3. Print server response (using the dedicated function)
+    print_response_message(response);
+    status_code = get_status_code(response);
+
+    if (status_code == 101) {
+        return 0; // Success (Server status code 101 handles success message)
+    } else {
+        // Failure (Server status codes like 400 handle error messages)
+        return -1; 
+    }
+}
+
+// Handle LOGIN command: log in an existing user
+// Returns: 0 on success, -1 on failure
+int handle_login(int sock, const char *username, const char *password) {
+    char command[512];
+    char response[BUFF_SIZE];
+    int status_code;
+    
+    // Check if the user is already logged in
+    if (g_client.is_logged_in) {
+        // Already logged in, no need to send command, treat as successful for main loop continuation.
+        return 0; 
+    }
+
+    // 1. Construct the LOGIN command string
+    snprintf(command, sizeof(command), "LOGIN %s %s\r\n", username, password);
+    
+    // 2. Send command and wait for status response
+    if (send_command(sock, command, response, sizeof(response)) < 0) {
+        perror("[ERROR] Failed to send LOGIN command or receive response");
+        return -1;
+    }
+    
+    // 3. Print server response (using the dedicated function)
+    print_response_message(response);
+    status_code = get_status_code(response);
+    
+    if (status_code == 102) {
+        // Update client state upon successful login
+        g_client.is_logged_in = 1;
+        // Store username
+        strncpy(g_client.username, username, sizeof(g_client.username) - 1);
+        g_client.username[sizeof(g_client.username) - 1] = '\0';
+        return 0; // Success (Server status code 102 handles success message)
+    } else {
+        // Failure (Server status codes like 401 handle error messages)
+        return -1; 
+    }
+}
+
+
+
 // =============================================================================
 // SERVER CONNECTION
 // =============================================================================
@@ -514,33 +593,48 @@ void disconnect_from_server(int sock) {
 
 
 int main(int argc, char *argv[]) {
-    // Initialize client state
+    int auth_status = -1; // Status of the initial authentication attempt
+    
+    // 1. Initialize client state
+    printf("[INIT] Initializing client state...\n");
     init_client_state();
 
-    // Connect to main server
-    const char *SERVER_IP = "127.0.0.1";
-    g_client.server_socket = connect_to_server(SERVER_IP, SERVER_PORT);
-    
-    // Load or generate ClientID
+    // 2. Load or generate ClientID
     if (!load_client_id(&g_client.client_id)) {
         g_client.client_id = generate_client_id();
         if (!save_client_id(g_client.client_id)) {
-            printf("[ERROR] Cannot save client ID to config.txt\n");
+            fprintf(stderr, "[ERROR] Cannot save client ID to config.txt. Exiting.\n");
             return 1;
         }
-        printf("[INFO] First time run. Generated Client ID: %u\n", g_client.client_id);
+        printf("[INFO] Generated new Client ID: %u\n", g_client.client_id);
     } else {
         printf("[INFO] Loaded existing Client ID: %u\n", g_client.client_id);
     }
     
-    // Load shared files from index.txt
-    load_shared_files();
+    // 3. Connect to main server
+    const char *SERVER_IP = "127.0.0.1"; // Replace with dynamic configuration if needed
+    g_client.server_socket = connect_to_server(SERVER_IP, SERVER_PORT);
     
-    printf("[INFO] P2P Client initialized successfully\n");
-    printf("[INFO] Client ID: %u\n", g_client.client_id);
-    printf("[INFO] P2P Port: %d\n", g_client.p2p_port);
-    printf("[INFO] Shared files: %d\n", g_shared_files.count);
+    if (g_client.server_socket < 0) {
+        fprintf(stderr, "[ERROR] Failed to connect to server. Exiting.\n");
+        return 1;
+    }
     
+    // Read initial '100' response from server (Connection Established)
+    char response[BUFF_SIZE];
+    if (read_line(g_client.server_socket, response, sizeof(response)) > 0) {
+        print_response_message(response);
+    } else {
+        fprintf(stderr, "[ERROR] Failed to receive initial server response. Closing.\n");
+        disconnect_from_server(g_client.server_socket);
+        return 1;
+    }
+
+    // ....
+
+    // 7. Cleanup and Exit
+    printf("[SHUTDOWN] Client shutting down.\n");
+    disconnect_from_server(g_client.server_socket);
     
     return 0;
 }
