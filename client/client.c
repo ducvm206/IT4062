@@ -196,6 +196,71 @@ int load_shared_files() {
     return g_shared_files.count;
 }
 
+// Add a new file entry to the local index.txt
+// Format: filename|filepath
+void add_to_local_index(const char *filename, const char *filepath) {
+    // Open in append mode to add to the end of file
+    FILE *fp = fopen("index.txt", "a");
+    if (fp == NULL) {
+        perror("[ERROR] Could not open index.txt for writing");
+        return;
+    }
+    
+    fprintf(fp, "%s|%s\n", filename, filepath);
+    fclose(fp);
+    
+    // Reload memory structure
+    load_shared_files();
+}
+
+// Remove a file entry from the local index.txt
+void remove_from_local_index(const char *filename) {
+    FILE *fp = fopen("index.txt", "r");
+    if (!fp) return;
+
+    FILE *temp = fopen("index.tmp", "w");
+    if (!temp) {
+        fclose(fp);
+        return;
+    }
+
+    char line[768];
+    char current_filename[256];
+    
+    // Read each line and copy to temp file EXCEPT the one to be removed
+    while (fgets(line, sizeof(line), fp)) {
+        char line_copy[768];
+        strcpy(line_copy, line);
+        
+        char *token = strtok(line_copy, "|");
+        if (token && strcmp(token, filename) != 0) {
+            fputs(line, temp);
+        }
+    }
+
+    fclose(fp);
+    fclose(temp);
+    
+    // Replace old index with new index
+    remove("index.txt");
+    rename("index.tmp", "index.txt");
+    
+    // Reload memory structure
+    load_shared_files();
+}
+
+// Find the local physical path of a shared filename
+// Returns 1 if found, 0 otherwise
+int get_local_path(const char *filename, char *path_out) {
+    for (int i = 0; i < g_shared_files.count; i++) {
+        if (strcmp(g_shared_files.files[i].filename, filename) == 0) {
+            strcpy(path_out, g_shared_files.files[i].filepath);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Extract status code integer from response string
 int get_status_code(const char *response) {
     if (response == NULL || strlen(response) < 3) {
@@ -427,30 +492,28 @@ int handle_search(int sock, const char *filename, PeerInfo peers_out[], int max_
     int read_status = read_line(sock, line, sizeof(line));
     
     if (read_status <= 0) {
-        // Connection error or closed
         return -1;
     }
 
-    // Display initial status
+    // Display initial status (e.g., "210 OK")
     print_response_message(line);
     
     // Check for success code '210'
     if (strcmp(line, "210") != 0) {
-        // Command failed (e.g., 404 File not found)
         return 0; 
     }
     
-    // 3. Read list of peers until termination line "."
+    // 3. Read list of peers until a blank line is received (\r\n\r\n)
     int peer_count = 0;
     while (peer_count < max_peers) {
-        // Note: read_line returns 1 on success, 0 on no data (shouldn't happen here), -1 on error
         if (read_line(sock, line, sizeof(line)) != 1) { 
-            // Connection error during list reading
             return -1; 
         }
         
-        // Check for list termination line "."
-        if (strcmp(line, ".") == 0) {
+        // CHECK FOR TERMINATION: 
+        // If the line is empty (strlen == 0), it means we just received the second \r\n 
+        // of the \r\n\r\n sequence.
+        if (strlen(line) == 0) {
             break;
         }
         
@@ -462,7 +525,6 @@ int handle_search(int sock, const char *filename, PeerInfo peers_out[], int max_
                    current_peer.ip_address, 
                    &current_peer.port) == 3) {
             
-            // Store successful peer info
             peers_out[peer_count] = current_peer;
             peer_count++;
         } else {
@@ -482,8 +544,6 @@ int handle_register(int sock, const char *username, const char *password) {
     
     // Check if the user is already logged in (Prevent unnecessary request)
     if (g_client.is_logged_in) {
-        // Warning relies on server message/logic. Returning failure to register.
-        // If server allows re-registration (which it shouldn't), the server response handles the status.
         return -1; 
     }
 
@@ -517,7 +577,6 @@ int handle_login(int sock, const char *username, const char *password) {
     
     // Check if the user is already logged in
     if (g_client.is_logged_in) {
-        // Already logged in, no need to send command, treat as successful for main loop continuation.
         return 0; 
     }
 
@@ -547,6 +606,54 @@ int handle_login(int sock, const char *username, const char *password) {
     }
 }
 
+// Handle PUBLISH command
+int handle_publish(int sock, const char *filename, const char *filepath) {
+    char command[512];
+    char response[BUFF_SIZE];
+
+    if (!g_client.is_logged_in) return -1;
+
+    // 1. Send PUBLISH command to Server
+    // Format according to previous discussion: PUBLISH <filename>
+    snprintf(command, sizeof(command), "PUBLISH %s\r\n", filename);
+    
+    if (send_command(sock, command, response, sizeof(response)) < 0) return -1;
+
+    int status = get_status_code(response);
+    if (status == 201 || status == 103) { // 201 or 103 based on your print_response_message
+        // 2. Success from server -> Update local index.txt
+        add_to_local_index(filename, filepath);
+        print_response_message(response);
+        return 0;
+    }
+    
+    print_response_message(response);
+    return -1;
+}
+
+// Handle UNPUBLISH command: Remove from server index AND local index.txt
+int handle_unpublish(int sock, const char *filename) {
+    char command[512];
+    char response[BUFF_SIZE];
+
+    if (!g_client.is_logged_in) return -1;
+
+    // Send UNPUBLISH to Server
+    snprintf(command, sizeof(command), "UNPUBLISH %s\r\n", filename);
+    
+    if (send_command(sock, command, response, sizeof(response)) < 0) return -1;
+
+    int status = get_status_code(response);
+    if (status == 202 || status == 104) {
+        // Success -> Remove from local index.txt
+        remove_from_local_index(filename);
+        print_response_message(response);
+        return 0;
+    }
+
+    print_response_message(response);
+    return -1;
+}
 
 
 // =============================================================================

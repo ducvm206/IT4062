@@ -555,194 +555,125 @@ void handle_sendinfo(Session *session, uint32_t client_id, int port) {
 // Handle SEARCH command from client
 // Command format: SEARCH <Filename>
 void handle_search(Session *session, const char *filename) {
-    // 1. Check login status
-    // The SEARCH command requires the client to be logged in to ensure authorization.
+    // Authorization check
+    // Clients must be logged in to perform a search.
     if (!session->is_logged_in) {
-        send_response(session->socket_fd, "403\r\n"); // 403: User not logged in (Forbidden)
+        send_response(session->socket_fd, "403\r\n"); // 403: Forbidden
         log_to_file("ERR", "SEARCH", 0, inet_ntoa(session->client_addr.sin_addr),
                     ntohs(session->client_addr.sin_port), "403");
         return;
     }
 
-    // 2. Prepare response buffer
-    char response[BUFF_SIZE * 2]; 
-
-    // Start building the response with the success code (210 - File found, starting list)
-    int len = snprintf(response, sizeof(response), "210\r\n"); 
-    int file_found = 0; // Counter and flag to track if any peer was found
-
-    // 3. Prepare and execute SQL query
-    MYSQL_STMT *stmt;
-    
-    // SQL QUERY: Select DISTINCT ClientID, IP Address, and P2P Port from the clients table 
-    // for all files matching the specified filename. This effectively finds all peers
-    // who are sharing this file.
+    // Prepare SQL Query
     const char *query = 
         "SELECT DISTINCT c.client_id, c.ip_address, c.port "
         "FROM files f "
         "JOIN clients c ON f.client_id = c.client_id "
-        "WHERE f.filename = ?;"; // Use '?' as a placeholder for the filename
+        "WHERE f.filename = ?;";
 
-    // Acquire the database lock to prevent concurrent write/read issues
     pthread_mutex_lock(&db_mutex);
-
-    // Initialize prepared statement
-    stmt = mysql_stmt_init(db);
-    if (stmt == NULL) {
-        fprintf(stderr, "[ERROR] SQL error on SEARCH init: %s\n", mysql_error(db));
+    MYSQL_STMT *stmt = mysql_stmt_init(db);
+    if (!stmt) {
         pthread_mutex_unlock(&db_mutex);
-        send_response(session->socket_fd, "500\r\n"); // 500: Internal server error
-        log_to_file("ERR", "SEARCH", session->client_id,
-                    inet_ntoa(session->client_addr.sin_addr),
-                    ntohs(session->client_addr.sin_port), "500");
+        send_response(session->socket_fd, "500\r\n"); // 500: Internal Server Error
         return;
     }
 
-    // Prepare the SQL statement
     if (mysql_stmt_prepare(stmt, query, strlen(query)) != 0) {
-        fprintf(stderr, "[ERROR] SQL error on SEARCH prepare: %s\n", mysql_stmt_error(stmt));
+        fprintf(stderr, "[ERROR] MySQL stmt prepare failed: %s\n", mysql_stmt_error(stmt));
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
-        send_response(session->socket_fd, "500\r\n"); // 500: Internal server error
-        log_to_file("ERR", "SEARCH", session->client_id,
-                    inet_ntoa(session->client_addr.sin_addr),
-                    ntohs(session->client_addr.sin_port), "500");
+        send_response(session->socket_fd, "500\r\n");
         return;
     }
-    
-    // Bind filename to the placeholder (?) to prevent SQL Injection
+
+    // Bind the filename parameter to the query to prevent SQL Injection
     MYSQL_BIND bind_param;
     memset(&bind_param, 0, sizeof(bind_param));
     unsigned long filename_len = strlen(filename);
-
-    // Bind the filename parameter (input)
     bind_param.buffer_type = MYSQL_TYPE_STRING;
     bind_param.buffer = (char *)filename;
     bind_param.buffer_length = filename_len;
-    bind_param.length = &filename_len; // Length of the data being sent
-    
-    // Execute the binding
-    if (mysql_stmt_bind_param(stmt, &bind_param) != 0) {
-        fprintf(stderr, "[ERROR] SQL error on SEARCH bind param: %s\n", mysql_stmt_error(stmt));
-        mysql_stmt_close(stmt);
-        pthread_mutex_unlock(&db_mutex);
-        send_response(session->socket_fd, "500\r\n");
-        log_to_file("ERR", "SEARCH", session->client_id,
-                    inet_ntoa(session->client_addr.sin_addr),
-                    ntohs(session->client_addr.sin_port), "500");
-        return;
-    }
-    
-    // Execute query
+    bind_param.length = &filename_len;
+
+    mysql_stmt_bind_param(stmt, &bind_param);
+
     if (mysql_stmt_execute(stmt) != 0) {
-        fprintf(stderr, "[ERROR] SQL error on SEARCH execute: %s\n", mysql_stmt_error(stmt));
+        fprintf(stderr, "[ERROR] MySQL stmt execute failed: %s\n", mysql_stmt_error(stmt));
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
-        log_to_file("ERR", "SEARCH", session->client_id,
-                    inet_ntoa(session->client_addr.sin_addr),
-                    ntohs(session->client_addr.sin_port), "500");
         return;
     }
-    
-    // Bind result columns (output)
-    uint32_t client_id;
-    char ip_address[16];
-    int port;
-    unsigned long ip_len;
-    my_bool is_null[3];
-    my_bool error[3];
+
+    // Bind result columns
+    uint32_t res_client_id;
+    char res_ip[16];
+    int res_port;
+    unsigned long res_ip_len;
     
     MYSQL_BIND bind_result[3];
     memset(bind_result, 0, sizeof(bind_result));
-    
-    // Client ID (UINT, stored as LONG in C for 32-bit compatibility)
-    bind_result[0].buffer_type = MYSQL_TYPE_LONG;
-    bind_result[0].buffer = &client_id;
-    bind_result[0].is_null = &is_null[0];
-    bind_result[0].error = &error[0];
-    
-    // IP Address (VARCHAR(15))
-    bind_result[1].buffer_type = MYSQL_TYPE_STRING;
-    bind_result[1].buffer = ip_address;
-    bind_result[1].buffer_length = sizeof(ip_address) - 1;
-    bind_result[1].length = &ip_len; // Actual length of the retrieved IP string
-    bind_result[1].is_null = &is_null[1];
-    bind_result[1].error = &error[1];
-    
-    // P2P Port (INT)
-    bind_result[2].buffer_type = MYSQL_TYPE_LONG;
-    bind_result[2].buffer = &port;
-    bind_result[2].is_null = &is_null[2];
-    bind_result[2].error = &error[2];
-    
-    if (mysql_stmt_bind_result(stmt, bind_result) != 0) {
-        fprintf(stderr, "[ERROR] SQL error on SEARCH bind result: %s\n", mysql_stmt_error(stmt));
-        mysql_stmt_close(stmt);
-        pthread_mutex_unlock(&db_mutex);
-        send_response(session->socket_fd, "500\r\n");
-        log_to_file("ERR", "SEARCH", session->client_id,
-                    inet_ntoa(session->client_addr.sin_addr),
-                    ntohs(session->client_addr.sin_port), "500");
-        return;
-    }
-    
-    // Store result (optional but allows retrieving the number of rows or repeated fetching)
+
+    // Bind ClientID (Output)
+    bind_result[0].buffer_type = MYSQL_TYPE_LONG; 
+    bind_result[0].buffer = &res_client_id;
+
+    // Bind IP Address (Output)
+    bind_result[1].buffer_type = MYSQL_TYPE_STRING; 
+    bind_result[1].buffer = res_ip;
+    bind_result[1].buffer_length = sizeof(res_ip);
+    bind_result[1].length = &res_ip_len;
+
+    // Bind P2P Port (Output)
+    bind_result[2].buffer_type = MYSQL_TYPE_LONG; 
+    bind_result[2].buffer = &res_port;
+
+    mysql_stmt_bind_result(stmt, bind_result);
     mysql_stmt_store_result(stmt);
-    
-    // 4. Iterate over query results
-    // Loop through each row returned by the SQL query (i.e., each sharing peer)
-    while (mysql_stmt_fetch(stmt) == 0) {
-        // Null-terminate the retrieved IP address string (since it's a variable-length string)
-        ip_address[ip_len] = '\0'; 
-        
-        // Append the peer information to the response buffer.
-        // Format: <ClientID> <IP Address> <P2P Port>\r\n
-        int added = snprintf(response + len, sizeof(response) - len, 
-                             "%u %s %d\r\n", 
-                             client_id, 
-                             ip_address, 
-                             port);
-        
-        // Check for buffer overflow to ensure we don't write past the buffer limit
-        if (len + added >= sizeof(response)) {
-            fprintf(stderr, "[WARNING] Search result buffer exceeded size for file '%s'. Truncating list.\n", filename);
-            break; // Stop iterating if buffer is full
-        }
-        
-        len += added; // Update the current length of the response buffer
-        file_found++; // Increment the counter
-    }
 
-    // Clean up the prepared statement resources
-    mysql_stmt_free_result(stmt); // Free result set buffer
-    mysql_stmt_close(stmt);      // Close the statement handle
-    // Release the database lock
-    pthread_mutex_unlock(&db_mutex);
+    int file_found = mysql_stmt_num_rows(stmt);
 
-    // 5. Send results back to the client
+    // 4. Send the search results to the client
     if (file_found > 0) {
-        // Add the list termination line: ".\r\n"
-        len += snprintf(response + len, sizeof(response) - len, ".\r\n");
+        // Send initial success code (210: File found, list follows)
+        send_response(session->socket_fd, "210\r\n");
+
+        char peer_line[256];
         
-        // Send the complete response (210 + Peer List + termination '.')
-        if (send(session->socket_fd, response, len, 0) < 0) {
-            perror("[ERROR] Failed to send search results");
+        // Fetch rows one by one and send directly to the socket
+        // This avoids buffer overflow for large results.
+        while (mysql_stmt_fetch(stmt) == 0) {
+            res_ip[res_ip_len] = '\0'; // Null-terminate IP string
+            int p_len = snprintf(peer_line, sizeof(peer_line), "%u %s %d\r\n", 
+                                 res_client_id, res_ip, res_port);
+            
+            if (send(session->socket_fd, peer_line, p_len, 0) < 0) {
+                perror("[ERROR] Send peer info failed");
+                break; 
+            }
         }
 
-        printf("[INFO] Sent search results for file '%s' (Total peers: %d)\n", filename, file_found);
-        log_to_file("OK", "SEARCH", session->client_id,
-                    inet_ntoa(session->client_addr.sin_addr),
-                    ntohs(session->client_addr.sin_port), "210");
+        // TERMINATION: Send a final blank line to signify the end of the list.
+        // Combined with the \r\n from the last peer line, this creates \r\n\r\n.
+        send(session->socket_fd, "\r\n", 2, 0); 
 
+        printf("[INFO] SEARCH: Found '%s' at %d peers. List sent to %u.\n", 
+               filename, file_found, session->client_id);
+        log_to_file("OK", "SEARCH", session->client_id, inet_ntoa(session->client_addr.sin_addr), 
+                    ntohs(session->client_addr.sin_port), "210");
     } else {
-        // If no rows were found, send the 'Not Found' error code
-        send_response(session->socket_fd, "404\r\n"); // 404: File not found
-        printf("[INFO] File '%s' not found. Sent 404.\n", filename);
-        log_to_file("OK", "SEARCH", session->client_id,
-                    inet_ntoa(session->client_addr.sin_addr),
+        // File not found in the database index
+        send_response(session->socket_fd, "404\r\n"); // 404: Not Found
+        printf("[INFO] SEARCH: File '%s' not found. Sent 404.\n", filename);
+        log_to_file("OK", "SEARCH", session->client_id, inet_ntoa(session->client_addr.sin_addr), 
                     ntohs(session->client_addr.sin_port), "404");
     }
+
+    // Resource Cleanup
+    mysql_stmt_free_result(stmt);
+    mysql_stmt_close(stmt);
+    pthread_mutex_unlock(&db_mutex);
 }
 
 // Handle REGISTER command from client
