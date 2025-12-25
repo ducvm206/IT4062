@@ -16,6 +16,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+// Interface integration
+#include "interface.h"
+
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -115,12 +118,14 @@ void print_response_message(const char *response) {
     else if (strncmp(response, "212", 3) == 0) {
         printf("[SUCCESS] File list retrieved\n");
     }
+    else if (strncmp(response, "220", 3) == 0) {
+        printf("[SUCCESS] File downloaded successfully\n");
+    }
     // 3xx: Protocol errors
     else if (strncmp(response, "300", 3) == 0) {
         printf("[ERROR] Invalid message format\n");
     }
     else if (strncmp(response, "301", 3) == 0) {
-        // Custom code for Invalid port number (Server sends this)
         printf("[ERROR] Invalid port number\n");
     }
     // 4xx: Client errors
@@ -141,6 +146,9 @@ void print_response_message(const char *response) {
     }
     else if (strncmp(response, "405", 3) == 0) {
         printf("[ERROR] Client ID already exists\n");
+    }
+    else if (strncmp(response, "410", 3) == 0) {
+        printf("[ERROR] Cannot connect to peer / Download failed\n");
     }
     // 5xx: Server errors
     else if (strncmp(response, "500", 3) == 0) {
@@ -473,66 +481,66 @@ int handle_sendinfo(int sock) {
 // Handle SEARCH command: search for a file and populate peer list
 // Returns: Number of peers found (>= 0), or -1 if command failed.
 int handle_search(int sock, const char *filename, PeerInfo peers_out[], int max_peers) {
+    // Authorization check
     if (!g_client.is_logged_in) {
-        print_response_message("403"); // Not logged in
+        printf("[ERROR] You must be logged in to search.\n");
         return -1; 
     }
     
     char command[512];
     char line[BUFF_SIZE];
     
-    // 1. Send SEARCH command
+    // Send SEARCH command to the central server
     snprintf(command, sizeof(command), "SEARCH %s\r\n", filename);
     if (send_all(sock, command, strlen(command)) < 0) {
         perror("[ERROR] Failed to send SEARCH command");
         return -1;
     }
     
-    // 2. Read the initial response (Status code: 210, 404, etc.)
-    int read_status = read_line(sock, line, sizeof(line));
-    
-    if (read_status <= 0) {
+    // Read initial response (Expected "210 File Found")
+    if (read_line(sock, line, sizeof(line)) <= 0) {
         return -1;
     }
 
-    // Display initial status (e.g., "210 OK")
-    print_response_message(line);
-    
-    // Check for success code '210'
-    if (strcmp(line, "210") != 0) {
+    // Check if the server returned success code 210
+    // Note: We use strncmp because the line might be "210 File Found"
+    if (strncmp(line, "210", 3) != 0) {
+        print_response_message(line); // Display error like 404 or 403
         return 0; 
     }
     
-    // 3. Read list of peers until a blank line is received (\r\n\r\n)
+    printf("[INFO] Peers holding '%s':\n", filename);
+
+    // Read peer list until a blank line is received
     int peer_count = 0;
     while (peer_count < max_peers) {
-        if (read_line(sock, line, sizeof(line)) != 1) { 
-            return -1; 
-        }
+        int n = read_line(sock, line, sizeof(line));
         
-        // CHECK FOR TERMINATION: 
-        // If the line is empty (strlen == 0), it means we just received the second \r\n 
-        // of the \r\n\r\n sequence.
-        if (strlen(line) == 0) {
+        // Error or connection closed
+        if (n < 0) return -1; 
+        
+        // A blank line (just \r\n) means the end of the peer list
+        if (n == 0 || strlen(line) == 0) {
             break;
         }
         
-        PeerInfo current_peer;
-        
-        // Parse peer info: <ClientID> <IP Address> <P2P Port>
+        // Parse peer info: "ClientID IP Port"
         if (sscanf(line, "%u %15s %d", 
-                   &current_peer.client_id, 
-                   current_peer.ip_address, 
-                   &current_peer.port) == 3) {
+                    &peers_out[peer_count].client_id, 
+                    peers_out[peer_count].ip_address, 
+                    &peers_out[peer_count].port) == 3) {
             
-            peers_out[peer_count] = current_peer;
+            // Print for user to see the options
+            printf("[%d] ID: %u | IP: %s | Port: %d\n", 
+                    peer_count + 1,
+                    peers_out[peer_count].client_id, 
+                    peers_out[peer_count].ip_address, 
+                    peers_out[peer_count].port);
+            
             peer_count++;
-        } else {
-            fprintf(stderr, "[WARNING] Invalid peer format received: %s\n", line);
         }
     }
-    
-    return peer_count; // Return the number of peers found
+    return peer_count;
 }
 
 // Handle REGISTER command: register a new user
@@ -655,6 +663,85 @@ int handle_unpublish(int sock, const char *filename) {
     return -1;
 }
 
+// Handle DOWNLOAD command: download file from peer
+// Format: DOWNLOAD <filename> 
+void handle_download(const char* peer_ip, int peer_port, const char* filename) {
+    long filesize = 0;
+    
+    // Connect and perform handshake to get file size
+    // initiate_p2p_handshake will send "DOWNLOAD <filename>"
+    int sock = initiate_p2p_handshake(peer_ip, peer_port, filename, &filesize);
+    
+    if (sock < 0) {
+        printf("[ERROR] Handshake failed. Peer might be offline or file missing.\n");
+        return;
+    }
+
+    // Step 2: Create a local file to write the binary data
+    FILE *fp = fopen(filename, "wb"); 
+    if (fp == NULL) {
+        perror("[ERROR] Could not create local file");
+        close(sock);
+        return;
+    }
+
+    printf("[P2P-INFO] Starting download: %s (%ld bytes)\n", filename, filesize);
+
+    char buffer[BUFF_SIZE];
+    long total_received = 0;
+    int n;
+
+    // Step 3: Receive data in chunks until the full file size is reached
+    while (total_received < filesize) {
+        n = recv(sock, buffer, sizeof(buffer), 0);
+        if (n <= 0) {
+            if (n < 0) perror("[ERROR] recv error");
+            break; // Connection lost or unexpected close
+        }
+
+        // Write the received chunk into the file
+        fwrite(buffer, 1, n, fp);
+        total_received += n;
+
+        // Visual progress update
+        printf("\r[P2P-INFO] Progress: %.2f%% (%ld/%ld bytes)", 
+               (double)total_received / filesize * 100, total_received, filesize);
+        fflush(stdout);
+    }
+
+    if (total_received == filesize) {
+        printf("\n[P2P-INFO] Download completed successfully!\n");
+    } else {
+        printf("\n[P2P-WARN] Download interrupted. File may be corrupted.\n");
+    }
+
+    fclose(fp);
+    close(sock);
+}
+
+// This function streams the actual file data to the downloader
+void handle_download_request(int peer_sock, const char* filename) {
+    FILE *fp = fopen(filename, "rb"); // Open file in binary read mode
+    if (fp == NULL) {
+        perror("[P2P-ERR] Failed to open file for reading");
+        return;
+    }
+
+    char buffer[BUFF_SIZE];
+    int bytes_read;
+
+    // Read the file chunk by chunk and send it through the socket
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        if (send_all(peer_sock, buffer, bytes_read) < 0) {
+            fprintf(stderr, "[P2P-ERR] Failed to send file data\n");
+            break;
+        }
+    }
+
+    printf("[P2P-INFO] Finished sending file: %s\n", filename);
+    fclose(fp);
+}
+
 
 // =============================================================================
 // SERVER CONNECTION
@@ -698,50 +785,137 @@ void disconnect_from_server(int sock) {
     }
 }
 
+// =============================================================================
+// P2P CONNECTION FUNCTIONS
+// =============================================================================
 
-int main(int argc, char *argv[]) {
-    int auth_status = -1; // Status of the initial authentication attempt
+// Handle incoming P2P connection requests (Uploader side) 
+void* handle_p2p_request(void* arg) {
+    int peer_sock = *(int*)arg; // Extract the peer socket from arguments
+    free(arg);                  // Free the allocated memory for the socket pointer
+    char line[BUFF_SIZE];
     
-    // 1. Initialize client state
-    printf("[INIT] Initializing client state...\n");
-    init_client_state();
-
-    // 2. Load or generate ClientID
-    if (!load_client_id(&g_client.client_id)) {
-        g_client.client_id = generate_client_id();
-        if (!save_client_id(g_client.client_id)) {
-            fprintf(stderr, "[ERROR] Cannot save client ID to config.txt. Exiting.\n");
-            return 1;
+    // Read the command line from the downloader (e.g., "DOWNLOAD filename.txt")
+    if (read_line(peer_sock, line, sizeof(line)) > 0) {
+        printf("\n[P2P] Incoming message: %s\n", line);
+        
+        char command[16], filename[256];
+        // Parse the message to extract command and filename
+        if (sscanf(line, "%s %s", command, filename) == 2 && strcmp(command, "DOWNLOAD") == 0) {
+            
+            struct stat st;
+            // Check if the file exists on the local disk
+            if (stat(filename, &st) == 0) {
+                char response[128];
+                // Send success handshake with file size back to downloader
+                snprintf(response, sizeof(response), "FILE_OK %ld\r\n", st.st_size);
+                send_all(peer_sock, response, strlen(response));
+                
+                // Automatically start streaming file data
+                handle_download_request(peer_sock, filename);
+            } else {
+                // Respond with error if the file is not found locally
+                const char* err = "FILE_NOT_FOUND\r\n";
+                send_all(peer_sock, err, strlen(err));
+                printf("[P2P-WARN] Requested file not found: %s\n", filename);
+            }
         }
-        printf("[INFO] Generated new Client ID: %u\n", g_client.client_id);
-    } else {
-        printf("[INFO] Loaded existing Client ID: %u\n", g_client.client_id);
     }
     
-    // 3. Connect to main server
-    const char *SERVER_IP = "127.0.0.1"; // Replace with dynamic configuration if needed
-    g_client.server_socket = connect_to_server(SERVER_IP, SERVER_PORT);
+    // Close the connection once the transfer is finished or an error occurs
+    close(peer_sock);
+    return NULL;
+}
+
+/* Background thread to listen for P2P connections on port 6000 */
+void* p2p_listener_thread(void* arg) {
+    int server_fd, *new_sock;
+    struct sockaddr_in address;
+    int opt = 1;
+    int addrlen = sizeof(address);
+
+    // Create a TCP socket for listening
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) return NULL;
     
-    if (g_client.server_socket < 0) {
-        fprintf(stderr, "[ERROR] Failed to connect to server. Exiting.\n");
-        return 1;
+    // Set socket options to allow immediate reuse of the port after restart
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY; // Listen on all available network interfaces
+    address.sin_port = htons(P2P_PORT);    // Standard P2P port (6000)
+
+    // Bind the socket to the port
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) return NULL;
+    
+    // Start listening for incoming connections (queue up to 10 clients)
+    if (listen(server_fd, 10) < 0) return NULL;
+
+    printf("[P2P] Listener started on port %d\n", P2P_PORT);
+
+    while (1) {
+        new_sock = malloc(sizeof(int));
+        // Accept a new connection from a peer
+        *new_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+        if (*new_sock >= 0) {
+            pthread_t tid;
+            // Create a dedicated thread to handle each peer so the listener doesn't block
+            pthread_create(&tid, NULL, handle_p2p_request, (void*)new_sock);
+            pthread_detach(tid); // Automatically reclaim thread resources when finished
+        } else {
+            free(new_sock);
+        }
     }
-    
-    // Read initial '100' response from server (Connection Established)
+    return NULL;
+}
+
+/* Connect to a peer and perform handshake for downloading (Downloader side) */
+int initiate_p2p_handshake(const char* peer_ip, int peer_port, const char* filename, long *filesize_out) {
+    int sock = 0;
+    struct sockaddr_in peer_addr;
     char response[BUFF_SIZE];
-    if (read_line(g_client.server_socket, response, sizeof(response)) > 0) {
-        print_response_message(response);
-    } else {
-        fprintf(stderr, "[ERROR] Failed to receive initial server response. Closing.\n");
-        disconnect_from_server(g_client.server_socket);
-        return 1;
+    char command[512];
+
+    // Create a TCP socket for the outbound connection
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) return -1;
+
+    peer_addr.sin_family = AF_INET;
+    peer_addr.sin_port = htons(peer_port);
+    inet_pton(AF_INET, peer_ip, &peer_addr.sin_addr); // Convert string IP to binary format
+
+    // Attempt to connect to the target Peer's IP and Port
+    if (connect(sock, (struct sockaddr *)&peer_addr, sizeof(peer_addr)) < 0) {
+        close(sock);
+        return -1;
     }
 
-    // ....
+    // Prepare and send the DOWNLOAD command to start the handshake
+    snprintf(command, sizeof(command), "DOWNLOAD %s\r\n", filename);
+    if (send_all(sock, command, strlen(command)) < 0) {
+        close(sock);
+        return -1;
+    }
 
-    // 7. Cleanup and Exit
-    printf("[SHUTDOWN] Client shutting down.\n");
-    disconnect_from_server(g_client.server_socket);
-    
+    // Read the response from the Peer to confirm if the file is available
+    if (read_line(sock, response, sizeof(response)) <= 0) {
+        close(sock);
+        return -1;
+    }
+
+    // If the peer responds with FILE_OK, parse the file size and return the socket
+    if (strncmp(response, "FILE_OK", 7) == 0) {
+        sscanf(response, "FILE_OK %ld", filesize_out);
+        return sock; // Handshake successful: return the active socket for downloading
+    }
+
+    printf("[ERROR] Handshake failed. Peer says: %s\n", response);
+    close(sock);
+    return -1;
+}
+
+// Main program loop
+int main(int argc, char *argv[]) {
+    init_client_state();
+    load_shared_files();
+    start_gui(argc, argv);
     return 0;
 }
