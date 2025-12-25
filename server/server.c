@@ -11,9 +11,10 @@
 #include <errno.h>
 #include <time.h>
 #include <pthread.h>
-#include <sqlite3.h>
+#include <mysql/mysql.h>
 #include <openssl/sha.h>
 #include <arpa/inet.h>
+#include "../config.h"
 
 /* =============================================================================
    CONSTANTS
@@ -24,10 +25,18 @@
 #define BUFF_SIZE 8192               // Buffer size for socket I/O operations
 #define MAX_CLIENTS 128              // Maximum number of concurrent client connections
 #define MAX_TOTAL_FILES 4096         // Maximum number of files in the index
-#define BACKLOG 20                   // Maximum pending connections in listen queue
 #define INDEX_FILE "index.txt"       // File name for storing the file index
-#define DATABASE_FILE "database"    // SQLite database file for account management
 #define PASSWORD_HASH_LENGTH 65      // Length of SHA256 hex string + null terminator
+#define LOG_FILE "logs.txt"          // Log file name
+
+// MySQL connection parameters
+#define MYSQL_HOST "localhost"
+#define MYSQL_USER "p2puser"
+#define MYSQL_PASSWORD "p2ppass"
+#define MYSQL_DATABASE "p2p_db"
+#define MYSQL_PORT 3306
+#define BACKLOG 10
+//#define MYSQL_PORT 3306              // MySQL port
 
 /* =============================================================================
    STRUCTS
@@ -36,6 +45,7 @@
 // Structure for session information
 typedef struct
 {
+    uint32_t client_id;
     int socket_fd;                  // Socket file descriptor of client
     struct sockaddr_in client_addr; // Client connection address information
     int account_id;                 // User ID from database, -1 if not logged in
@@ -66,8 +76,6 @@ typedef struct
     time_t published_time;           // Timestamp when file was published
 } FileIndexEntry;
 
-
-
 /* =============================================================================
    GLOBAL VARIABLES
    ============================================================================= */
@@ -78,7 +86,7 @@ pthread_mutex_t session_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Client information management - stores P2P connection details from SENDINFO
 ClientInfo client_infos[MAX_CLIENTS];
-int client_info_count = 0;
+int client_info_count = 0; 
 pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // File index management - in-memory cache of shared files loaded from index.txt
@@ -87,8 +95,11 @@ int file_index_count = 0;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Database connection for account authentication and management
-sqlite3 *db = NULL;
+MYSQL *db = NULL;
 pthread_mutex_t db_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 /* =============================================================================
    UTILITY FUNCTIONS
@@ -143,40 +154,187 @@ ssize_t find_crlf(const char *buf, size_t len)
     return -1;
 }
 
+int send_all(int sockfd, const char *buf, size_t len)
+{
+    size_t total_sent = 0;
+
+    while (total_sent < len)
+    {
+        ssize_t n = send(sockfd,
+                         buf + total_sent,
+                         len - total_sent,
+                         0);
+        if (n <= 0)
+        {
+            return -1; // lỗi hoặc client đóng kết nối
+        }
+        total_sent += n;
+    }
+
+    return 0; // thành công
+}
+
+int read_line(int sockfd, char *buf, size_t maxlen)
+{
+    size_t i = 0;
+    char c;
+
+    while (i < maxlen - 1)
+    {
+        ssize_t n = recv(sockfd, &c, 1, 0);
+        if (n == 1)
+        {
+            buf[i++] = c;
+            if (c == '\n')
+            {
+                break;
+            }
+        }
+        else if (n == 0)
+        {
+            // client đóng kết nối
+            break;
+        }
+        else
+        {
+            // lỗi recv
+            return -1;
+        }
+    }
+
+    buf[i] = '\0';
+    return (int)i;
+}
+
+// Logs client transaction activity to a file (server.log).
+// Format: [TIMESTAMP] $ OK/ERR $ [COMMAND] from [ClientID] at [IP:Port] $ [STATUS CODE]
+void log_to_file(const char *status, const char *command, uint32_t client_id, 
+                 const char *ip_address, int port, const char *status_code) 
+{
+    char timestamp[32];
+    time_t now = time(NULL);
+    
+    // Get the current TIMESTAMP (Format: YYYY-MM-DD HH:MM:SS)
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    
+    // Format the complete log string
+    char log_line[BUFF_SIZE];
+    int written = snprintf(log_line, sizeof(log_line),
+        "[%s] $ %s $ %s from %u at %s:%d $ %s\n",
+        timestamp,
+        status,
+        command,
+        client_id,
+        ip_address,
+        port,
+        status_code
+    );
+
+    if (written >= sizeof(log_line)) {
+        // Warning if the log line exceeds buffer size and was truncated
+        fprintf(stderr, "[WARNING] Log message truncated: %s\n", log_line);
+    }
+
+    // Write log to file (Uses Mutex for multi-threading safety)
+    pthread_mutex_lock(&log_mutex);
+
+    FILE *fp = fopen(LOG_FILE, "a"); // "a" mode opens the file for appending
+    if (fp == NULL) {
+        perror("[FATAL] Failed to open log file for writing");
+    } else {
+        fprintf(fp, "%s", log_line);
+        fclose(fp); // Close file immediately after writing
+    }
+
+    pthread_mutex_unlock(&log_mutex);
+}
+
 /* =============================================================================
    DATABASE OPERATIONS
    ============================================================================= */
 
-// Initialize SQLite database connection and create accounts table if needed
+// Initialize MySQL database connection and create tables if needed
 // Returns: 0 on success, -1 on failure
 int init_database()
 {
-    int rc = sqlite3_open(DATABASE_FILE, &db);
-    if (rc != SQLITE_OK)
+    // Initialize MySQL connection
+    db = mysql_init(NULL);
+    if (db == NULL)
     {
-        fprintf(stderr, "[ERROR] Cannot open database: %s\n", sqlite3_errmsg(db));
+        fprintf(stderr, "[ERROR] Cannot initialize MySQL: %s\n", mysql_error(db));
         return -1;
+    }
+    
+    // Connect to MySQL server
+    if (mysql_real_connect(db, MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, 
+                          MYSQL_DATABASE, MYSQL_PORT, NULL, 0) == NULL)
+    {
+        fprintf(stderr, "[ERROR] Cannot connect to MySQL: %s\n", mysql_error(db));
+        mysql_close(db);
+        db = NULL;
+        return -1;
+    }
+    
+    // Set character set to UTF-8
+    if (mysql_set_character_set(db, "utf8mb4") != 0)
+    {
+        fprintf(stderr, "[WARNING] Cannot set character set: %s\n", mysql_error(db));
     }
     
     // Create accounts table with required schema
-    char *err_msg = NULL;
-    const char *create_table_sql = 
+    const char *create_accounts_sql = 
         "CREATE TABLE IF NOT EXISTS accounts ("
-        "account_id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "username TEXT NOT NULL UNIQUE,"
-        "password_hash TEXT NOT NULL,"
+        "account_id INT AUTO_INCREMENT PRIMARY KEY,"
+        "username VARCHAR(64) NOT NULL UNIQUE,"
+        "password_hash VARCHAR(65) NOT NULL,"
         "created_at DATETIME DEFAULT CURRENT_TIMESTAMP"
-        ");";
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
     
-    rc = sqlite3_exec(db, create_table_sql, NULL, NULL, &err_msg);
-    if (rc != SQLITE_OK)
+    if (mysql_query(db, create_accounts_sql) != 0)
     {
-        fprintf(stderr, "[ERROR] Failed to create table: %s\n", err_msg);
-        sqlite3_free(err_msg);
+        fprintf(stderr, "[ERROR] Failed to create accounts table: %s\n", mysql_error(db));
+        mysql_close(db);
+        db = NULL;
         return -1;
     }
     
-    printf("[INFO] Accounts database initialized\n");
+    // Create clients table
+    const char *create_clients_sql = 
+        "CREATE TABLE IF NOT EXISTS clients ("
+        "client_id INT UNSIGNED PRIMARY KEY,"
+        "account_id INT NOT NULL,"
+        "ip_address VARCHAR(15) NOT NULL,"
+        "port INT NOT NULL,"
+        "last_seen DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+        "FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+    
+    if (mysql_query(db, create_clients_sql) != 0)
+    {
+        fprintf(stderr, "[ERROR] Failed to create clients table: %s\n", mysql_error(db));
+        // Continue anyway, table might already exist
+    }
+    
+    // Create files table
+    const char *create_files_sql = 
+        "CREATE TABLE IF NOT EXISTS files ("
+        "file_id INT AUTO_INCREMENT PRIMARY KEY,"
+        "client_id INT UNSIGNED NOT NULL,"
+        "filename VARCHAR(255) NOT NULL,"
+        "filesize BIGINT NOT NULL,"
+        "published_at DATETIME DEFAULT CURRENT_TIMESTAMP,"
+        "FOREIGN KEY (client_id) REFERENCES clients(client_id) ON DELETE CASCADE,"
+        "INDEX idx_files_filename (filename)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+    
+    if (mysql_query(db, create_files_sql) != 0)
+    {
+        fprintf(stderr, "[ERROR] Failed to create files table: %s\n", mysql_error(db));
+        // Continue anyway, table might already exist
+    }
+    
+    printf("[INFO] MySQL database initialized successfully\n");
+    printf("[INFO] Connected to database: %s@%s/%s\n", MYSQL_USER, MYSQL_HOST, MYSQL_DATABASE);
     return 0;
 }
 
@@ -187,7 +345,7 @@ int init_database()
 // Load file index from index.txt into memory
 // File format: filename client_id ip_address port timestamp
 void load_index_file()
-{
+{   // Open index.txt
     FILE *fp = fopen(INDEX_FILE, "r");
     if (!fp)
     {
@@ -322,37 +480,65 @@ void remove_from_file_index(const char *filename, uint32_t client_id)
    ============================================================================= */
 
 // Update or add client connection information (from SENDINFO command)
-// Parameters:
-//   client_id: Client's unique identifier
-//   ip_address: Client's IP address
-//   port: Client's P2P listening port
-//   account_id: Account ID of authenticated user
-void update_client_info(uint32_t client_id, const char *ip_address, int port, int account_id) {
-    pthread_mutex_lock(&client_mutex);
-    
-    int found = 0;
-    for (int i = 0; i < client_info_count; i++) {
-        if (client_infos[i].client_id == client_id) {
-            // Update existing entry ONLY if same account
-            if (client_infos[i].account_id == account_id) {
-                strncpy(client_infos[i].ip_address, ip_address, INET_ADDRSTRLEN - 1);
-                client_infos[i].port = port;
-                found = 1;
-            }
-            break;
-        }
+int update_client_info(uint32_t client_id, int account_id, const char *ip, int port) {
+    // SQL query to insert or update client info if ID already exists
+    const char *query = 
+        "INSERT INTO clients (client_id, account_id, ip_address, port, last_seen) "
+        "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+        "ON DUPLICATE KEY UPDATE "
+        "account_id = VALUES(account_id), "
+        "ip_address = VALUES(ip_address), "
+        "port = VALUES(port), "
+        "last_seen = CURRENT_TIMESTAMP;";
+
+    MYSQL_STMT *stmt = NULL;
+    int status = 0;
+
+    pthread_mutex_lock(&db_mutex);
+
+    stmt = mysql_stmt_init(db);
+    if (!stmt) {
+        pthread_mutex_unlock(&db_mutex);
+        return -1;
     }
-    
-    if (!found && client_info_count < MAX_CLIENTS) {
-        // Add new entry
-        client_infos[client_info_count].client_id = client_id;
-        strncpy(client_infos[client_info_count].ip_address, ip_address, INET_ADDRSTRLEN - 1);
-        client_infos[client_info_count].port = port;
-        client_infos[client_info_count].account_id = account_id;
-        client_info_count++;
+
+    if (mysql_stmt_prepare(stmt, query, strlen(query))) {
+        fprintf(stderr, "[ERROR] SQL error on update_client_info prepare: %s\n", mysql_stmt_error(stmt));
+        status = -1;
+        goto cleanup;
     }
-    
-    pthread_mutex_unlock(&client_mutex);
+
+    // Bind parameters: client_id, account_id, ip_address, port
+    MYSQL_BIND bind[4];
+    memset(bind, 0, sizeof(bind));
+
+    bind[0].buffer_type = MYSQL_TYPE_LONG; // client_id (uint32)
+    bind[0].buffer = (void*)&client_id;
+
+    bind[1].buffer_type = MYSQL_TYPE_LONG; // account_id
+    bind[1].buffer = (void*)&account_id;
+
+    bind[2].buffer_type = MYSQL_TYPE_STRING; // ip_address
+    bind[2].buffer = (void*)ip;
+    bind[2].buffer_length = strlen(ip);
+
+    bind[3].buffer_type = MYSQL_TYPE_LONG; // p2p_port
+    bind[3].buffer = (void*)&port;
+
+    if (mysql_stmt_bind_param(stmt, bind)) {
+        status = -1;
+        goto cleanup;
+    }
+
+    if (mysql_stmt_execute(stmt)) {
+        fprintf(stderr, "[ERROR] SQL error on update_client_info execute: %s\n", mysql_stmt_error(stmt));
+        status = -1;
+    }
+
+cleanup:
+    mysql_stmt_close(stmt);
+    pthread_mutex_unlock(&db_mutex);
+    return status;
 }
 
 // Retrieve client connection information by client ID
@@ -387,59 +573,568 @@ int get_client_info(uint32_t client_id, char *ip_address, int *port)
 
 // Handle SENDINFO command from client
 // Command format: SENDINFO <ClientID> <Port>
-void handle_sendinfo(Session *session, uint32_t client_id, int port) {
-    // Check if client is authenticated
+void handle_sendinfo(Session *session, uint32_t client_id, int p2p_port) {
+
+    // Authorization check
     if (!session->is_logged_in) {
-        send_response(session->socket_fd, "403\r\n");
+        send_response(session->socket_fd, "403\r\n"); // Forbidden
+        return;
+    }
+
+    // Identify client IP from the connection socket
+    char *client_ip = inet_ntoa(session->client_addr.sin_addr);
+    session->client_id = client_id;
+
+    // Update MySQL database
+    if (update_client_info(client_id, session->account_id, client_ip, p2p_port) != 0) {
+        send_response(session->socket_fd, "500\r\n"); // Internal Server Error
+        log_to_file("ERR", "SENDINFO", client_id, client_ip, p2p_port, "500");
+        return;
+    }
+
+    send_response(session->socket_fd, "103\r\n"); // 103: Information accepted
+    
+    printf("[INFO] Client %u updated info: IP=%s, P2P_Port=%d\n", client_id, client_ip, p2p_port);
+    log_to_file("OK", "SENDINFO", client_id, client_ip, p2p_port, "103");
+}
+
+// Handle SEARCH command from client
+// Command format: SEARCH <Filename>
+void handle_search(Session *session, const char *filename) {
+    // 1. Authorization check: Clients must be logged in to perform a search
+    if (!session->is_logged_in) {
+        send_response(session->socket_fd, "403\r\n"); // 403: Forbidden
+        log_to_file("ERR", "SEARCH", 0, inet_ntoa(session->client_addr.sin_addr),
+                    ntohs(session->client_addr.sin_port), "403");
+        return;
+    }
+
+    // 2. Prepare SQL Query: Join files and clients to get initial peer info
+    const char *query = 
+        "SELECT DISTINCT c.client_id, c.ip_address, c.port "
+        "FROM files f "
+        "JOIN clients c ON f.client_id = c.client_id "
+        "WHERE f.filename = ?;";
+
+    pthread_mutex_lock(&db_mutex); // Lock database for thread safety
+    MYSQL_STMT *stmt = mysql_stmt_init(db);
+    if (!stmt) {
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n"); // 500: Internal Server Error
+        return;
+    }
+
+    if (mysql_stmt_prepare(stmt, query, strlen(query)) != 0) {
+        fprintf(stderr, "[ERROR] MySQL stmt prepare failed: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+
+    // 3. Bind Parameters: Prevent SQL Injection by binding the filename
+    MYSQL_BIND bind_param;
+    memset(&bind_param, 0, sizeof(bind_param));
+    unsigned long filename_len = strlen(filename);
+    bind_param.buffer_type = MYSQL_TYPE_STRING;
+    bind_param.buffer = (char *)filename;
+    bind_param.buffer_length = filename_len;
+    bind_param.length = &filename_len;
+
+    mysql_stmt_bind_param(stmt, &bind_param);
+
+    if (mysql_stmt_execute(stmt) != 0) {
+        fprintf(stderr, "[ERROR] MySQL stmt execute failed: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+
+    // 4. Bind Results: Map DB columns to local variables
+    uint32_t res_client_id;
+    char res_ip[16];
+    int res_port;
+    unsigned long res_ip_len;
+    
+    MYSQL_BIND bind_result[3];
+    memset(bind_result, 0, sizeof(bind_result));
+
+    bind_result[0].buffer_type = MYSQL_TYPE_LONG; 
+    bind_result[0].buffer = &res_client_id;
+
+    bind_result[1].buffer_type = MYSQL_TYPE_STRING; 
+    bind_result[1].buffer = res_ip;
+    bind_result[1].buffer_length = sizeof(res_ip);
+    bind_result[1].length = &res_ip_len;
+
+    bind_result[2].buffer_type = MYSQL_TYPE_LONG; 
+    bind_result[2].buffer = &res_port;
+
+    mysql_stmt_bind_result(stmt, bind_result);
+    mysql_stmt_store_result(stmt);
+
+    int file_found_in_db = mysql_stmt_num_rows(stmt);
+
+    // 5. Response Processing: Filter by active sessions and send to client
+    if (file_found_in_db > 0) {
+        // Send success code (210: File found, peer list follows)
+        send_response(session->socket_fd, "210\r\n");
+
+        char peer_line[256];
+        int online_peers = 0;
+        
+        // Fetch each potential peer from DB
+        while (mysql_stmt_fetch(stmt) == 0) {
+            res_ip[res_ip_len] = '\0'; 
+            
+            // CROSS-CHECK: Ensure this peer is currently ONLINE in active sessions
+            pthread_mutex_lock(&session_mutex);
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (sessions[i].is_active && sessions[i].client_id == res_client_id) {
+                    
+                    // Use the current real-time IP from the socket connection
+                    char *current_ip = inet_ntoa(sessions[i].client_addr.sin_addr);
+                    
+                    // Format: "ClientID IP Port\r\n"
+                    int p_len = snprintf(peer_line, sizeof(peer_line), "%u %s %d\r\n", 
+                                         res_client_id, current_ip, res_port);
+                    
+                    send(session->socket_fd, peer_line, p_len, 0);
+                    online_peers++;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&session_mutex);
+        }
+
+        // TERMINATION: Send a blank line to signify the end of the 210 list
+        send(session->socket_fd, "\r\n", 2, 0); 
+
+        printf("[INFO] SEARCH: Found '%s' at %d online peers.\n", filename, online_peers);
+        log_to_file("OK", "SEARCH", session->client_id, inet_ntoa(session->client_addr.sin_addr), 
+                    ntohs(session->client_addr.sin_port), "210");
+    } else {
+        // 404: No one in the database has this file
+        send_response(session->socket_fd, "404\r\n");
+        log_to_file("OK", "SEARCH", session->client_id, inet_ntoa(session->client_addr.sin_addr), 
+                    ntohs(session->client_addr.sin_port), "404");
+    }
+
+    // 6. Resource Cleanup
+    mysql_stmt_free_result(stmt);
+    mysql_stmt_close(stmt);
+    pthread_mutex_unlock(&db_mutex);
+}
+
+// Handle REGISTER command from client
+// Command format: REGISTER username password
+// Response codes:
+//   101: Đăng ký thành công
+//   400: Username đã tồn tại hoặc password < 6 ký tự
+//   300: Không xác định được kiểu thông điệp (đã được xử lý ở process_request)
+void handle_register(Session *session, const char *username, const char *password)
+{
+    // 1. Kiểm tra độ dài password (tối thiểu 6 ký tự)
+    if (strlen(password) < 6)
+    {
+        send_response(session->socket_fd, "400\r\n");
         return;
     }
     
-    // Validate port range
-    if (port < 1024 || port > 65535) {
-        send_response(session->socket_fd, "301\r\n");
-        return;
-    }
+    // 2. Kiểm tra username đã tồn tại chưa
+    pthread_mutex_lock(&db_mutex);
     
-    // Extract client IP safely
-    char client_ip[INET_ADDRSTRLEN];
-    if (inet_ntop(AF_INET, &(session->client_addr.sin_addr), client_ip, sizeof(client_ip)) == NULL) {
+    MYSQL_STMT *stmt = mysql_stmt_init(db);
+    if (stmt == NULL)
+    {
+        fprintf(stderr, "[ERROR] Cannot initialize MySQL statement: %s\n", mysql_error(db));
+        pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         return;
     }
     
-    // Check if this client_id is already registered to another account
-    pthread_mutex_lock(&client_mutex);
-    for (int i = 0; i < client_info_count; i++) {
-        if (client_infos[i].client_id == client_id && 
-            client_infos[i].account_id != session->account_id) {
-            pthread_mutex_unlock(&client_mutex);
-            send_response(session->socket_fd, "405\r\n"); // Client ID already in use
+    const char *check_sql = "SELECT account_id FROM accounts WHERE username = ?;";
+    
+    if (mysql_stmt_prepare(stmt, check_sql, strlen(check_sql)) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER check prepare: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Bind username parameter
+    MYSQL_BIND bind_param;
+    memset(&bind_param, 0, sizeof(bind_param));
+    bind_param.buffer_type = MYSQL_TYPE_STRING;
+    bind_param.buffer = (char *)username;
+    bind_param.buffer_length = strlen(username);
+    bind_param.length = &bind_param.buffer_length;
+    
+    if (mysql_stmt_bind_param(stmt, &bind_param) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER check bind: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Execute query
+    if (mysql_stmt_execute(stmt) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER check execute: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Store result
+    mysql_stmt_store_result(stmt);
+    
+    // Kiểm tra xem username đã tồn tại chưa
+    if (mysql_stmt_num_rows(stmt) > 0)
+    {
+        // Username đã tồn tại
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "400\r\n");
+        return;
+    }
+    
+    mysql_stmt_close(stmt);
+    
+    // 3. Hash password
+    char password_hash[PASSWORD_HASH_LENGTH];
+    hash_password(password, password_hash);
+    
+    // 4. Insert tài khoản mới vào database
+    stmt = mysql_stmt_init(db);
+    if (stmt == NULL)
+    {
+        fprintf(stderr, "[ERROR] Cannot initialize MySQL statement: %s\n", mysql_error(db));
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    const char *insert_sql = "INSERT INTO accounts (username, password_hash) VALUES (?, ?);";
+    
+    if (mysql_stmt_prepare(stmt, insert_sql, strlen(insert_sql)) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER insert prepare: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Bind parameters
+    MYSQL_BIND bind_params[2];
+    memset(bind_params, 0, sizeof(bind_params));
+    
+    unsigned long username_len = strlen(username);
+    bind_params[0].buffer_type = MYSQL_TYPE_STRING;
+    bind_params[0].buffer = (char *)username;
+    bind_params[0].buffer_length = username_len;
+    bind_params[0].length = &username_len;
+    
+    unsigned long hash_len = strlen(password_hash);
+    bind_params[1].buffer_type = MYSQL_TYPE_STRING;
+    bind_params[1].buffer = password_hash;
+    bind_params[1].buffer_length = hash_len;
+    bind_params[1].length = &hash_len;
+    
+    if (mysql_stmt_bind_param(stmt, bind_params) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on REGISTER insert bind: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Thực thi insert
+    if (mysql_stmt_execute(stmt) != 0)
+    {
+        // Có thể là lỗi UNIQUE constraint (username đã tồn tại - race condition)
+        unsigned int err_no = mysql_stmt_errno(stmt);
+        if (err_no == 1062) // ER_DUP_ENTRY
+        {
+            fprintf(stderr, "[ERROR] Username already exists: %s\n", username);
+            mysql_stmt_close(stmt);
+            pthread_mutex_unlock(&db_mutex);
+            send_response(session->socket_fd, "400\r\n");
+            return;
+        }
+        fprintf(stderr, "[ERROR] SQL error on REGISTER insert execute: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    mysql_stmt_close(stmt);
+    pthread_mutex_unlock(&db_mutex);
+    
+    // 5. Gửi response thành công
+    send_response(session->socket_fd, "101\r\n");
+    printf("[INFO] New account registered: username=%s\n", username);
+}
+
+// Handle LOGIN command from client
+// Command format: LOGIN username password
+// Response codes:
+//   102: Đăng nhập thành công
+//   401: Tài khoản không tồn tại hoặc sai mật khẩu
+//   300: Không xác định được kiểu thông điệp (đã được xử lý ở process_request)
+void handle_login(Session *session, const char *username, const char *password)
+{
+    // 1. Hash password để so sánh
+    char password_hash[PASSWORD_HASH_LENGTH];
+    hash_password(password, password_hash);
+    
+    // 2. Tìm tài khoản trong database
+    pthread_mutex_lock(&db_mutex);
+    
+    MYSQL_STMT *stmt = mysql_stmt_init(db);
+    if (stmt == NULL)
+    {
+        fprintf(stderr, "[ERROR] Cannot initialize MySQL statement: %s\n", mysql_error(db));
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    const char *query_sql = "SELECT account_id, password_hash FROM accounts WHERE username = ?;";
+    
+    // If prepare fails (server error)
+    if (mysql_stmt_prepare(stmt, query_sql, strlen(query_sql)) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on LOGIN prepare: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Bind username parameter
+    MYSQL_BIND bind_param;
+    memset(&bind_param, 0, sizeof(bind_param));
+    unsigned long username_len = strlen(username);
+    bind_param.buffer_type = MYSQL_TYPE_STRING;
+    bind_param.buffer = (char *)username;
+    bind_param.buffer_length = username_len;
+    bind_param.length = &username_len;
+    
+    // Execute the binding
+    if (mysql_stmt_bind_param(stmt, &bind_param) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on LOGIN bind: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Execute query
+    if (mysql_stmt_execute(stmt) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on LOGIN execute: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Bind result columns
+    int account_id;
+    char stored_hash[PASSWORD_HASH_LENGTH];
+    unsigned long hash_len;
+    my_bool is_null[2];
+    my_bool error[2];
+    
+    MYSQL_BIND bind_result[2];
+    memset(bind_result, 0, sizeof(bind_result));
+    
+    bind_result[0].buffer_type = MYSQL_TYPE_LONG;
+    bind_result[0].buffer = &account_id;
+    bind_result[0].is_null = &is_null[0];
+    bind_result[0].error = &error[0];
+    
+    bind_result[1].buffer_type = MYSQL_TYPE_STRING;
+    bind_result[1].buffer = stored_hash;
+    bind_result[1].buffer_length = sizeof(stored_hash) - 1;
+    bind_result[1].length = &hash_len;
+    bind_result[1].is_null = &is_null[1];
+    bind_result[1].error = &error[1];
+    
+    // Execute the result binding
+    if (mysql_stmt_bind_result(stmt, bind_result) != 0)
+    {
+        fprintf(stderr, "[ERROR] SQL error on LOGIN bind result: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
+    
+    // Store result
+    mysql_stmt_store_result(stmt);
+    
+    // Fetch result
+    int rc = mysql_stmt_fetch(stmt);
+    if (rc == 0)
+    {
+        // Tìm thấy username, so sánh password hash
+        stored_hash[hash_len] = '\0';
+        
+        if (strcmp(password_hash, stored_hash) == 0)
+        {
+            // Mật khẩu đúng - đăng nhập thành công
+            mysql_stmt_close(stmt);
+            pthread_mutex_unlock(&db_mutex);
+            
+            // Cập nhật session
+            pthread_mutex_lock(&session_mutex);
+            session->account_id = account_id;
+            strncpy(session->username, username, sizeof(session->username) - 1);
+            session->username[sizeof(session->username) - 1] = '\0';
+            session->is_logged_in = 1;
+            pthread_mutex_unlock(&session_mutex);
+            
+            // Gửi response thành công
+            send_response(session->socket_fd, "102\r\n");
+            printf("[INFO] User logged in: username=%s, account_id=%d\n", username, account_id);
+            return;
+        }
+        else
+        {
+            // Mật khẩu sai
+            mysql_stmt_close(stmt);
+            pthread_mutex_unlock(&db_mutex);
+            send_response(session->socket_fd, "401\r\n");
             return;
         }
     }
-    pthread_mutex_unlock(&client_mutex);
-    
-    // Store client_id in session
-    session->client_id = client_id;
-    
-    // Store or update client connection information
-    update_client_info(client_id, client_ip, port, session->account_id);
-    
-    // Send success response
-    send_response(session->socket_fd, "103\r\n");
-    printf("[INFO] Client info updated: Account=%d, ID=%u, IP=%s, Port=%d\n", 
-           session->account_id, client_id, client_ip, port);
+    else if (rc == MYSQL_NO_DATA)
+    {
+        // Không tìm thấy username
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "401\r\n");
+        return;
+    }
+    else
+    {
+        // Lỗi SQL
+        fprintf(stderr, "[ERROR] SQL error on LOGIN fetch: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        return;
+    }
 }
 
-// Headers for unfinished use cases
-void handle_register(Session *session, const char *username, const char *password);
-void handle_login(Session *session, const char *username, const char *password);
-void handle_publish(Session *session, uint32_t client_id, const char *filename);
-void handle_unpublish(Session *session, const char *filename);
-void handle_search(Session *session, const char *filename);
+void handle_publish(Session *session, const char *filename) {
+    char query[BUFF_SIZE];
+    MYSQL *conn = mysql_init(NULL);
+    if (!conn) {
+        send_response(session->socket_fd, "500 DB Init Failed\r\n");
+        return;
+    }
+    
+    if (!mysql_real_connect(conn,
+            MYSQL_HOST,
+            MYSQL_USER,
+            MYSQL_PASSWORD,
+            MYSQL_DATABASE,
+            0,          // port = 0 → dùng mặc định
+            NULL,
+            0))
+    {
+        send_response(session->socket_fd, "500 DB Connection Failed\r\n");
+        mysql_close(conn);
+        return;
+    }
+    // Check if the client is logged in before allowing publish
+    if (!session->is_logged_in) {
+        send_all(session->socket_fd, "401 Unauthorized: Please login first\r\n", 39);
+        return;
+    }
+
+    // Insert or Update the file record in the database
+    // We associate the filename with the account_id of the current session
+    snprintf(query, sizeof(query), 
+             "INSERT INTO files (account_id, filename) VALUES (%d, '%s') "
+             "ON DUPLICATE KEY UPDATE account_id = %d", 
+             session->account_id, filename, session->account_id);
+
+    if (mysql_query(conn, query)) {
+        fprintf(stderr, "[DB-ERR] Publish failed: %s\n", mysql_error(conn));
+        send_all(session->socket_fd, "500 Internal Server Error\r\n", 27);
+    } else {
+        printf("[SERVER] Client %d published file: %s\n", session->account_id, filename);
+        // Respond with 200 OK
+        send_all(session->socket_fd, "200 File published successfully\r\n", 33);
+    }
+}
+
+void handle_unpublish(Session *session, const char *filename) {
+    char query[BUFF_SIZE];
+
+    MYSQL *conn = mysql_init(NULL);
+    if (!conn) {
+        send_response(session->socket_fd, "500 DB Init Failed\r\n");
+        return;
+    }
+
+    if (!mysql_real_connect(conn,
+            MYSQL_HOST,
+            MYSQL_USER,
+            MYSQL_PASSWORD,
+            MYSQL_DATABASE,
+            0,          // port = 0 → dùng mặc định
+            NULL,
+            0))
+    {
+        send_response(session->socket_fd, "500 DB Connection Failed\r\n");
+        mysql_close(conn);
+        return;
+    }
+
+    if (!session->is_logged_in) {
+        send_all(session->socket_fd, "401 Unauthorized\r\n", 18);
+        return;
+    }
+
+
+    // Delete the file entry that matches both filename and this client's account_id
+    snprintf(query, sizeof(query), 
+             "DELETE FROM files WHERE account_id = %d AND filename = '%s'", 
+             session->account_id, filename);
+
+    if (mysql_query(conn, query)) {
+        fprintf(stderr, "[DB-ERR] Unpublish failed: %s\n", mysql_error(conn));
+        send_all(session->socket_fd, "500 Internal Server Error\r\n", 27);
+    } else {
+        // Check if any row was actually deleted
+        if (mysql_affected_rows(conn) > 0) {
+            printf("[SERVER] Client %d unpublished file: %s\n", session->account_id, filename);
+            send_all(session->socket_fd, "200 File unpublished successfully\r\n", 35);
+        } else {
+            send_all(session->socket_fd, "404 File not found in your share list\r\n", 39);
+        }
+    }
+}
+
 void handle_logout(Session *session);
 
 // Process a single client request line
+/*
 void process_request(Session *session, char *request)
 {
     // Remove trailing "\r\n"
@@ -492,22 +1187,21 @@ void process_request(Session *session, char *request)
     }
     else if (strcmp(command, "PUBLISH") == 0)
     {
-        uint32_t client_id;
         char filename[256];
-        if (sscanf(argument, "%u %255s", &client_id, filename) != 2)
+        if (sscanf(payload, "%255s", filename) != 1)
         {
             send_response(session->socket_fd, "300\r\n");
-            return;
+            continue;
         }
-        handle_publish(session, client_id, filename);
+        handle_publish(session, filename);
     }
     else if (strcmp(command, "UNPUBLISH") == 0)
     {
         char filename[256];
-        if (sscanf(argument, "%255s", filename) != 1)
+        if (sscanf(payload, "%255s", filename) != 1)
         {
             send_response(session->socket_fd, "300\r\n");
-            return;
+            continue;
         }
         handle_unpublish(session, filename);
     }
@@ -530,6 +1224,7 @@ void process_request(Session *session, char *request)
         send_response(session->socket_fd, "300\r\n");
     }
 }
+*/
 
 /* =============================================================================
    SESSION MANAGEMENT
@@ -552,108 +1247,115 @@ void cleanup_session(Session *session)
 // Parameters:
 //   arg: Pointer to Session structure
 // Returns: NULL (thread exit value)
+// Main loop to handle communication with a specific client session
 void *session_loop(void *arg)
 {
     Session *session = (Session *)arg;
-    int sockfd = session->socket_fd;
-    
-    // Initialize session state
-    session->buffer_len = 0;
-    session->is_active = 1;
-    session->is_logged_in = 0;
-    session->account_id = -1;
-    session->last_active = time(NULL);
-    
-    // Log connection information
-    char client_ip[INET_ADDRSTRLEN] = {0};
-    inet_ntop(AF_INET, &(session->client_addr.sin_addr), client_ip, sizeof(client_ip));
-    printf("[INFO] New connection: socket=%d ip=%s port=%d\n", 
-           sockfd, client_ip, ntohs(session->client_addr.sin_port));
-    
-    // Send welcome message to client
-    send_response(sockfd, "100\r\n");
-    
-    // Main session loop - handle client requests
-    while (session->is_active)
+    char buffer[BUFF_SIZE];
+    char command[32];
+    char payload[BUFF_SIZE];
+
+    printf("[SERVER] Started session for client from %s:%d\n",
+           inet_ntoa(session->client_addr.sin_addr),
+           ntohs(session->client_addr.sin_port));
+
+    // Send initial welcome message to client
+    send_all(session->socket_fd, "100 Connection Established\r\n", 28);
+
+    while (1)
     {
-        size_t cap = sizeof(session->recv_buffer);
-        if (session->buffer_len >= cap - 1)
-            break;
-        
-        size_t max_read = cap - session->buffer_len - 1;
-        
-        // Read data from client socket
-        ssize_t avail = recv(sockfd, session->recv_buffer + session->buffer_len, max_read, 0);
-        
-        if (avail == 0)
+        // Read a line of data from the client
+        int n = read_line(session->socket_fd, buffer, sizeof(buffer));
+        if (n <= 0)
         {
-            // Client disconnected gracefully
-            printf("[INFO] Client disconnected gracefully: %s\n", client_ip);
+            printf("[SERVER] Client disconnected or error occurred (ID: %d)\n", session->account_id);
             break;
         }
-        else if (avail < 0)
+
+        // Parse the incoming string into Command and Payload
+        // Format expected: "COMMAND Payload\r\n"
+        memset(command, 0, sizeof(command));
+        memset(payload, 0, sizeof(payload));
+        
+        int fields = sscanf(buffer, "%s %[^\r\n]", command, payload);
+        if (fields < 1) continue;
+
+        // 1. Handle AUTHENTICATION commands
+        if (strcmp(command, "REGISTER") == 0)
         {
-            // Handle socket errors
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            char username[64], password[64];
+            if (sscanf(payload, "%63s %63s", username, password) != 2)
             {
-                // No data available, sleep briefly and continue
-                usleep(10 * 1000);
+                send_response(session->socket_fd, "300\r\n");
                 continue;
             }
-            if (errno == EINTR)
-                continue; // Interrupted system call, retry
-            
-            perror("[ERROR] recv failed");
-            break;
+            handle_register(session, username, password);
         }
-        else
+        else if (strcmp(command, "LOGIN") == 0)
         {
-            // Data received successfully
-            session->buffer_len += (size_t)avail;
-            session->recv_buffer[session->buffer_len] = '\0';
-            session->last_active = time(NULL);
-            
-            // Process complete lines in buffer
-            while (1)
+            char username[64], password[64];
+            if (sscanf(payload, "%63s %63s", username, password) != 2)
             {
-                ssize_t idx = find_crlf(session->recv_buffer, session->buffer_len);
-                if (idx < 0)
-                    break; // No complete line yet
-                
-                // Extract complete line
-                size_t line_len = (size_t)idx;
-                char *line = (char *)malloc(line_len + 1);
-                if (!line)
-                {
-                    session->is_active = 0;
-                    break;
+                send_response(session->socket_fd, "300\r\n");
+                continue;
+            }
+            handle_login(session, username, password);
+        }
+        
+        // 2. Handle P2P FILE INDEXING commands (Requires Login)
+        else if (strcmp(command, "PUBLISH") == 0) {
+            handle_publish(session, payload);
+        }
+        else if (strcmp(command, "UNPUBLISH") == 0) {
+            handle_unpublish(session, payload);
+        }
+        
+        // 3. Handle SEARCH command
+        else if (strcmp(command, "SEARCH") == 0) {
+            handle_search(session, payload);
+        }
+
+        // 4. Handle DOWNLOAD STATUS updates (The 220/410 logic)
+        else if (strcmp(command, "UPDATE_STATUS") == 0) {
+            int status_code;
+            char filename[256];
+            if (sscanf(payload, "%d %s", &status_code, filename) == 2) {
+                if (status_code == 220) {
+                    printf("[STATUS] Client %d successfully downloaded: %s\n", session->account_id, filename);
+                    send_all(session->socket_fd, "200 Status 220 Recorded\r\n", 25);
+                } else if (status_code == 410) {
+                    printf("[STATUS] Client %d failed to download: %s\n", session->account_id, filename);
+                    send_all(session->socket_fd, "200 Status 410 Recorded\r\n", 25);
                 }
-                
-                memcpy(line, session->recv_buffer, line_len);
-                line[line_len] = '\0';
-                
-                // Remove processed line from buffer
-                size_t remain = session->buffer_len - (line_len + 2);
-                if (remain > 0)
-                    memmove(session->recv_buffer, session->recv_buffer + line_len + 2, remain);
-                
-                session->buffer_len = remain;
-                session->recv_buffer[session->buffer_len] = '\0';
-                
-                // Process the request line
-                process_request(session, line);
-                free(line);
-                
-                if (!session->is_active)
-                    break;
+            } else {
+                send_all(session->socket_fd, "400 Invalid Status Format\r\n", 27);
             }
         }
+
+        // 5. Handle QUIT command
+        else if (strcmp(command, "QUIT") == 0) {
+            send_all(session->socket_fd, "221 Goodbye\r\n", 13);
+            break;
+        }
+
+        // 6. Unknown command handling
+        else {
+            send_all(session->socket_fd, "500 Unknown Command\r\n", 21);
+        }
+
+        // Update the last active timestamp for timeout management
+        session->last_active = time(NULL);
     }
-    
-    // Clean up session and close socket
-    cleanup_session(session);
-    close(sockfd);
-    printf("[INFO] Session thread exiting for socket=%d\n", sockfd);
+
+    // Clean up session before thread exit
+    close(session->socket_fd);
+    pthread_mutex_lock(&session_mutex);
+    session->is_active = 0;
+    session->is_logged_in = 0;
+    session->account_id = -1;
+    pthread_mutex_unlock(&session_mutex);
+
+    printf("[SERVER] Session closed for client.\n");
     return NULL;
 }
 
@@ -735,6 +1437,11 @@ int accept_client_connection(int listenfd, struct sockaddr_in *client_addr, sock
     return new_sock;
 }
 
+// Connect to Client B via ClientID
+
+
+
+
 /* =============================================================================
    MAIN SERVER LOOP
    ============================================================================= */
@@ -755,13 +1462,13 @@ int main()
     int listenfd = init_server_socket();
     if (listenfd == -1)
     {
-        sqlite3_close(db);
+        mysql_close(db);
         return EXIT_FAILURE;
     }
     
     printf("[INFO] Server starting\n");
     printf("[INFO] File index stored in: %s\n", INDEX_FILE);
-    printf("[INFO] Accounts stored in: %s\n", DATABASE_FILE);
+    printf("[INFO] Database: MySQL (%s@%s/%s)\n", MYSQL_USER, MYSQL_HOST, MYSQL_DATABASE);
     
     // Initialize data structures
     memset(sessions, 0, sizeof(sessions));
@@ -839,6 +1546,6 @@ int main()
     
     // Cleanup (unreachable in normal operation)
     close(listenfd);
-    sqlite3_close(db);
+    mysql_close(db);
     return 0;
 }

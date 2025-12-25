@@ -16,6 +16,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+// Interface integration
+#include "interface.h"
+
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -26,7 +29,7 @@
 #define BUFF_SIZE 8192
 #define MAX_SHARED_FILES 256
 #define MAX_PEERS 128
-#define BUFFER_SIZE BUFF_SIZE  // Add this for consistency
+#define BUFFER_SIZE BUFF_SIZE
 
 // =============================================================================
 // STRUCTURES AND TYPE DEFINITIONS
@@ -115,9 +118,15 @@ void print_response_message(const char *response) {
     else if (strncmp(response, "212", 3) == 0) {
         printf("[SUCCESS] File list retrieved\n");
     }
+    else if (strncmp(response, "220", 3) == 0) {
+        printf("[SUCCESS] File downloaded successfully\n");
+    }
     // 3xx: Protocol errors
     else if (strncmp(response, "300", 3) == 0) {
         printf("[ERROR] Invalid message format\n");
+    }
+    else if (strncmp(response, "301", 3) == 0) {
+        printf("[ERROR] Invalid port number\n");
     }
     // 4xx: Client errors
     else if (strncmp(response, "400", 3) == 0) {
@@ -135,6 +144,12 @@ void print_response_message(const char *response) {
     else if (strncmp(response, "404", 3) == 0) {
         printf("[ERROR] File not found\n");
     }
+    else if (strncmp(response, "405", 3) == 0) {
+        printf("[ERROR] Client ID already exists\n");
+    }
+    else if (strncmp(response, "410", 3) == 0) {
+        printf("[ERROR] Cannot connect to peer / Download failed\n");
+    }
     // 5xx: Server errors
     else if (strncmp(response, "500", 3) == 0) {
         printf("[ERROR] Server error\n");
@@ -149,7 +164,6 @@ void print_response_message(const char *response) {
 // =============================================================================
 
 // Initialize client state
-// Sets default values for client state variables
 void init_client_state() {
     memset(&g_client, 0, sizeof(ClientState));          
     g_client.p2p_port = P2P_PORT;
@@ -161,23 +175,19 @@ void init_client_state() {
 
 // Load shared files from index.txt
 int load_shared_files() {
-    // Open index.txt for reading
+    // Implementation remains the same as it handles local file index.txt
     FILE *fp = fopen("index.txt", "r");
     if (!fp) {
         printf("[INFO] index.txt not found, no files to share\n");
         return 0;
     }
     
-    // Initialize shared files list
     g_shared_files.count = 0;
     char line[768];
 
-    // Read each line and parse file info
     while (fgets(line, sizeof(line), fp) && g_shared_files.count < MAX_SHARED_FILES) {
-        // Remove newline
         line[strcspn(line, "\r\n")] = 0;
         
-        // Parse line: filename|filepath
         char *token = strtok(line, "|");
         if (token) {
             strncpy(g_shared_files.files[g_shared_files.count].filename, token, 255);
@@ -189,10 +199,87 @@ int load_shared_files() {
         }
     }
 
-    // Close the file after reading
     fclose(fp);
     printf("[INFO] Loaded %d shared files from index.txt\n", g_shared_files.count);
     return g_shared_files.count;
+}
+
+// Add a new file entry to the local index.txt
+// Format: filename|filepath
+void add_to_local_index(const char *filename, const char *filepath) {
+    // Open in append mode to add to the end of file
+    FILE *fp = fopen("index.txt", "a");
+    if (fp == NULL) {
+        perror("[ERROR] Could not open index.txt for writing");
+        return;
+    }
+    
+    fprintf(fp, "%s|%s\n", filename, filepath);
+    fclose(fp);
+    
+    // Reload memory structure
+    load_shared_files();
+}
+
+// Remove a file entry from the local index.txt
+void remove_from_local_index(const char *filename) {
+    FILE *fp = fopen("index.txt", "r");
+    if (!fp) return;
+
+    FILE *temp = fopen("index.tmp", "w");
+    if (!temp) {
+        fclose(fp);
+        return;
+    }
+
+    char line[768];
+    char current_filename[256];
+    
+    // Read each line and copy to temp file EXCEPT the one to be removed
+    while (fgets(line, sizeof(line), fp)) {
+        char line_copy[768];
+        strcpy(line_copy, line);
+        
+        char *token = strtok(line_copy, "|");
+        if (token && strcmp(token, filename) != 0) {
+            fputs(line, temp);
+        }
+    }
+
+    fclose(fp);
+    fclose(temp);
+    
+    // Replace old index with new index
+    remove("index.txt");
+    rename("index.tmp", "index.txt");
+    
+    // Reload memory structure
+    load_shared_files();
+}
+
+// Find the local physical path of a shared filename
+// Returns 1 if found, 0 otherwise
+int get_local_path(const char *filename, char *path_out) {
+    for (int i = 0; i < g_shared_files.count; i++) {
+        if (strcmp(g_shared_files.files[i].filename, filename) == 0) {
+            strcpy(path_out, g_shared_files.files[i].filepath);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Extract status code integer from response string
+int get_status_code(const char *response) {
+    if (response == NULL || strlen(response) < 3) {
+        return 0; // Invalid response
+    }
+    // Check if the first three characters are digits
+    if (isdigit(response[0]) && isdigit(response[1]) && isdigit(response[2])) {
+        // Convert the status code part to integer
+        return atoi(response);
+    }
+    return 0;
 }
 
 // =============================================================================
@@ -200,22 +287,20 @@ int load_shared_files() {
 // =============================================================================
 
 // Load client ID from config.txt file
-// Returns: 1 if successful, 0 if not found
 int load_client_id(uint32_t *client_id) {
+    // Implementation remains the same
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
-        return 0;  // File doesn't exist
+        return 0; 
     }
     
     char line[256];
     *client_id = 0;
     
-    // Read each line looking for "ClientID="
     while (fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\r\n")] = 0;  // Remove newline
+        line[strcspn(line, "\r\n")] = 0;
         
         if (strncmp(line, "ClientID=", 9) == 0) {
-            // Parse the ClientID value
             *client_id = strtoul(line + 9, NULL, 10);
             fclose(fp);
             return 1;
@@ -223,18 +308,17 @@ int load_client_id(uint32_t *client_id) {
     }
     
     fclose(fp);
-    return 0;  // ClientID not found
+    return 0;
 }
 
 // Save client ID to config.txt file
-// Returns: 1 if successful, 0 on error
 int save_client_id(uint32_t client_id) {
+    // Implementation remains the same
     FILE *fp = fopen(CONFIG_FILE, "w");
     if (!fp) {
         return 0;
     }
     
-    // Write ClientID to file
     fprintf(fp, "ClientID=%u\n", client_id);
     fclose(fp);
     return 1;
@@ -247,11 +331,12 @@ uint32_t generate_client_id() {
 }
 
 // =============================================================================
-// SENDINFO HANDLING
+// SOCKET I/O UTILITY FUNCTIONS
 // =============================================================================
 
 // Send all data in buffer to socket
 ssize_t send_all(int sock, const char *buf, size_t len) {
+    // Implementation remains the same
     size_t total = 0;
     while (total < len) {
         ssize_t sent = send(sock, buf + total, len - total, 0);
@@ -263,136 +348,9 @@ ssize_t send_all(int sock, const char *buf, size_t len) {
     return (ssize_t)total;
 }
 
-// Send command and wait for response
-int send_command(int sock, const char *cmd, char *response, int resp_size) {
-    // Send command
-    if (send_all(sock, cmd, strlen(cmd)) < 0) {
-        perror("[ERROR] Failed to send command");
-        return -1;
-    }
-    
-    // Read response line (simple version)
-    int total = 0;
-    while (total < resp_size - 1) {
-        int bytes = recv(sock, response + total, resp_size - total - 1, 0);
-        if (bytes <= 0) {
-            return -1;  // Connection closed or error
-        }
-        total += bytes;
-        response[total] = '\0';
-        
-        // Check if we have complete response with \r\n
-        if (total >= 2 && response[total-2] == '\r' && response[total-1] == '\n') {
-            response[total-2] = '\0'; // Remove \r\n
-            return total;
-        }
-    }
-    return -1;
-}
-
-int handle_sendinfo(int sock) {
-    if (!g_client.is_logged_in) {
-        printf("[ERROR] Must login first\n");
-        return -1;
-    }
-    
-    // Validate ClientID
-    if (g_client.client_id == 0) {
-        printf("[ERROR] Invalid ClientID\n");
-        return -1;
-    }
-    
-    // Validate P2P port
-    if (g_client.p2p_port < 1024 || g_client.p2p_port > 65535) {
-        printf("[ERROR] Invalid P2P port: %d\n", g_client.p2p_port);
-        return -1;
-    }
-    
-    char command[256];
-    char response[BUFF_SIZE];
-    
-    // Build SENDINFO command
-    snprintf(command, sizeof(command), "SENDINFO %u %d\r\n", 
-             g_client.client_id, g_client.p2p_port);
-    
-    printf("[INFO] Sending client info: ID=%u, Port=%d\n", 
-           g_client.client_id, g_client.p2p_port);
-    
-    // Send command and get response
-    if (send_command(sock, command, response, sizeof(response)) <= 0) {
-        printf("[ERROR] Failed to send/receive SENDINFO\n");
-        return -1;
-    }
-    
-    // Parse response
-    if (strcmp(response, "103") == 0) {
-        printf("[SUCCESS] Client info registered with server\n");
-        printf("[INFO] Other clients can now connect to you at port %d\n", g_client.p2p_port);
-        return 0;
-    } 
-    else if (strcmp(response, "403") == 0) {
-        printf("[ERROR] Not logged in - please login first\n");
-        return -1;
-    }
-    else if (strcmp(response, "405") == 0) {
-        printf("[ERROR] Client ID already in use by another account\n");
-        return -1;
-    }
-    else if (strcmp(response, "301") == 0) {
-        printf("[ERROR] Invalid port number\n");
-        return -1;
-    }
-    else {
-        printf("[ERROR] Server response: %s\n", response);
-        return -1;
-    }
-}
-
-// =============================================================================
-// SERVER CONNECTION
-// =============================================================================
-
-int connect_to_server(const char *server_ip, int server_port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("[ERROR] Cannot create socket");
-        return -1;
-    }
-    
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(server_port);
-    
-    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
-        perror("[ERROR] Invalid server IP address");
-        close(sock);
-        return -1;
-    }
-    
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("[ERROR] Cannot connect to server");
-        close(sock);
-        return -1;
-    }
-    
-    printf("[INFO] Connected to server %s:%d\n", server_ip, server_port);
-    return sock;
-}
-
-void disconnect_from_server(int sock) {
-    if (sock >= 0) {
-        close(sock);
-        printf("[INFO] Disconnected from server\n");
-    }
-}
-
-// =============================================================================
-// LINE-BY-LINE MESSAGE PROCESSING FUNCTIONS (FOR OTHER COMMANDS)
-// =============================================================================
-
-// Find \r\n in buffer
+// Find \r\n in buffer (Used by read_line)
 ssize_t find_crlf(const char *buf, size_t len) {
+    // Implementation remains the same
     if (len < 2) return -1;
     for (size_t i = 0; i + 1 < len; ++i) {
         if (buf[i] == '\r' && buf[i + 1] == '\n')
@@ -401,8 +359,9 @@ ssize_t find_crlf(const char *buf, size_t len) {
     return -1;
 }
 
-// Read a complete line ending with \r\n from socket (for other commands)
+// Read a complete line ending with \r\n from socket
 int read_line(int sock, char *line, int line_size) {
+    // Implementation remains the same (important for robust line reading)
     static char buffer[BUFF_SIZE];
     static int buffer_pos = 0;
     
@@ -431,7 +390,7 @@ int read_line(int sock, char *line, int line_size) {
     // Read more data
     int max_read = sizeof(buffer) - buffer_pos - 1;
     if (max_read <= 0) {
-        fprintf(stderr, "[ERROR] Buffer full\n");
+        fprintf(stderr, "[ERROR] Internal buffer full\n");
         return -1;
     }
     
@@ -456,34 +415,507 @@ int read_line(int sock, char *line, int line_size) {
     return read_line(sock, line, line_size);
 }
 
-// =============================================================================
-// DEMONSTRATION MAIN FUNCTION
-// =============================================================================
-
-int main(int argc, char *argv[]) {
-    // Initialize client state
-    init_client_state();
-    
-    // Load or generate ClientID
-    if (!load_client_id(&g_client.client_id)) {
-        // If not found, generate new ClientID
-        g_client.client_id = generate_client_id();
-        if (!save_client_id(g_client.client_id)) {
-            printf("[ERROR] Cannot save client ID to config.txt\n");
-            return 1;
-        }
-        printf("[INFO] First time run. Generated Client ID: %u\n", g_client.client_id);
-    } else {
-        printf("[INFO] Loaded existing Client ID: %u\n", g_client.client_id);
+// Send command and wait for response (reads only the first line/status code)
+// NOTE: This version is only for simple command/status responses (e.g., LOGIN, SENDINFO)
+// For multi-line responses (e.g., SEARCH), use read_line directly.
+int send_command(int sock, const char *cmd, char *response, int resp_size) {
+    // 1. Send command
+    if (send_all(sock, cmd, strlen(cmd)) < 0) {
+        perror("[ERROR] Failed to send command");
+        return -1;
     }
     
-    // Load shared files from index.txt
+    // 2. Read the first line response
+    int read_status = read_line(sock, response, resp_size);
+    
+    if (read_status < 0) {
+        // Connection closed or buffer error
+        return -1;
+    } else if (read_status == 0) {
+        // No data available (shouldn't happen in synchronous command mode)
+        return -1;
+    }
+    
+    // Success: response contains the status code line
+    return 0;
+}
+
+// =============================================================================
+// COMMAND HANDLING
+// =============================================================================
+
+// Handle SENDINFO command: send ClientID and P2P port to server
+int handle_sendinfo(int sock) {
+    char command[512];
+    char response[BUFF_SIZE];
+    int status_code;
+    
+    // Check if the user is logged in
+    if (!g_client.is_logged_in) {
+        // If not logged in, server should reject this, but client-side check is safer.
+        return -1; 
+    }
+
+    // 1. Construct the SENDINFO command string
+    snprintf(command, sizeof(command), "SENDINFO %u %d\r\n", 
+             g_client.client_id, g_client.p2p_port);
+    
+    // 2. Send command and wait for status response
+    if (send_command(sock, command, response, sizeof(response)) < 0) {
+        perror("[ERROR] Failed to send SENDINFO command or receive response");
+        return -1;
+    }
+    
+    // 3. Print server response (using the dedicated function)
+    print_response_message(response);
+    status_code = get_status_code(response);
+    
+    if (status_code == 103) {
+        return 0; // Success (Server status code 103 handles success message)
+    } else {
+        // Failure (Server status codes like 405 handle error messages)
+        return -1; 
+    }
+}
+
+// Handle SEARCH command: search for a file and populate peer list
+// Returns: Number of peers found (>= 0), or -1 if command failed.
+int handle_search(int sock, const char *filename, PeerInfo peers_out[], int max_peers) {
+    // Authorization check
+    if (!g_client.is_logged_in) {
+        printf("[ERROR] You must be logged in to search.\n");
+        return -1; 
+    }
+    
+    char command[512];
+    char line[BUFF_SIZE];
+    
+    // Send SEARCH command to the central server
+    snprintf(command, sizeof(command), "SEARCH %s\r\n", filename);
+    if (send_all(sock, command, strlen(command)) < 0) {
+        perror("[ERROR] Failed to send SEARCH command");
+        return -1;
+    }
+    
+    // Read initial response (Expected "210 File Found")
+    if (read_line(sock, line, sizeof(line)) <= 0) {
+        return -1;
+    }
+
+    // Check if the server returned success code 210
+    // Note: We use strncmp because the line might be "210 File Found"
+    if (strncmp(line, "210", 3) != 0) {
+        print_response_message(line); // Display error like 404 or 403
+        return 0; 
+    }
+    
+    printf("[INFO] Peers holding '%s':\n", filename);
+
+    // Read peer list until a blank line is received
+    int peer_count = 0;
+    while (peer_count < max_peers) {
+        int n = read_line(sock, line, sizeof(line));
+        
+        // Error or connection closed
+        if (n < 0) return -1; 
+        
+        // A blank line (just \r\n) means the end of the peer list
+        if (n == 0 || strlen(line) == 0) {
+            break;
+        }
+        
+        // Parse peer info: "ClientID IP Port"
+        if (sscanf(line, "%u %15s %d", 
+                    &peers_out[peer_count].client_id, 
+                    peers_out[peer_count].ip_address, 
+                    &peers_out[peer_count].port) == 3) {
+            
+            // Print for user to see the options
+            printf("[%d] ID: %u | IP: %s | Port: %d\n", 
+                    peer_count + 1,
+                    peers_out[peer_count].client_id, 
+                    peers_out[peer_count].ip_address, 
+                    peers_out[peer_count].port);
+            
+            peer_count++;
+        }
+    }
+    return peer_count;
+}
+
+// Handle REGISTER command: register a new user
+// Returns: 0 on success, -1 on failure
+int handle_register(int sock, const char *username, const char *password) {
+    char command[512];
+    char response[BUFF_SIZE];
+    int status_code;
+    
+    // Check if the user is already logged in (Prevent unnecessary request)
+    if (g_client.is_logged_in) {
+        return -1; 
+    }
+
+    // 1. Construct the REGISTER command string
+    snprintf(command, sizeof(command), "REGISTER %s %s\r\n", username, password);
+    
+    // 2. Send command and wait for status response
+    if (send_command(sock, command, response, sizeof(response)) < 0) {
+        perror("[ERROR] Failed to send REGISTER command or receive response");
+        return -1;
+    }
+    
+    // 3. Print server response (using the dedicated function)
+    print_response_message(response);
+    status_code = get_status_code(response);
+
+    if (status_code == 101) {
+        return 0; // Success (Server status code 101 handles success message)
+    } else {
+        // Failure (Server status codes like 400 handle error messages)
+        return -1; 
+    }
+}
+
+// Handle LOGIN command: log in an existing user
+// Returns: 0 on success, -1 on failure
+int handle_login(int sock, const char *username, const char *password) {
+    char command[512];
+    char response[BUFF_SIZE];
+    int status_code;
+    
+    // Check if the user is already logged in
+    if (g_client.is_logged_in) {
+        return 0; 
+    }
+
+    // 1. Construct the LOGIN command string
+    snprintf(command, sizeof(command), "LOGIN %s %s\r\n", username, password);
+    
+    // 2. Send command and wait for status response
+    if (send_command(sock, command, response, sizeof(response)) < 0) {
+        perror("[ERROR] Failed to send LOGIN command or receive response");
+        return -1;
+    }
+    
+    // 3. Print server response (using the dedicated function)
+    print_response_message(response);
+    status_code = get_status_code(response);
+    
+    if (status_code == 102) {
+        // Update client state upon successful login
+        g_client.is_logged_in = 1;
+        // Store username
+        strncpy(g_client.username, username, sizeof(g_client.username) - 1);
+        g_client.username[sizeof(g_client.username) - 1] = '\0';
+        return 0; // Success (Server status code 102 handles success message)
+    } else {
+        // Failure (Server status codes like 401 handle error messages)
+        return -1; 
+    }
+}
+
+// Handle PUBLISH command
+int handle_publish(int sock, const char *filename, const char *filepath) {
+    char command[512];
+    char response[BUFF_SIZE];
+
+    if (!g_client.is_logged_in) return -1;
+
+    // 1. Send PUBLISH command to Server
+    // Format according to previous discussion: PUBLISH <filename>
+    snprintf(command, sizeof(command), "PUBLISH %s\r\n", filename);
+    
+    if (send_command(sock, command, response, sizeof(response)) < 0) return -1;
+
+    int status = get_status_code(response);
+    if (status == 201 || status == 103) { // 201 or 103 based on your print_response_message
+        // 2. Success from server -> Update local index.txt
+        add_to_local_index(filename, filepath);
+        print_response_message(response);
+        return 0;
+    }
+    
+    print_response_message(response);
+    return -1;
+}
+
+// Handle UNPUBLISH command: Remove from server index AND local index.txt
+int handle_unpublish(int sock, const char *filename) {
+    char command[512];
+    char response[BUFF_SIZE];
+
+    if (!g_client.is_logged_in) return -1;
+
+    // Send UNPUBLISH to Server
+    snprintf(command, sizeof(command), "UNPUBLISH %s\r\n", filename);
+    
+    if (send_command(sock, command, response, sizeof(response)) < 0) return -1;
+
+    int status = get_status_code(response);
+    if (status == 202 || status == 104) {
+        // Success -> Remove from local index.txt
+        remove_from_local_index(filename);
+        print_response_message(response);
+        return 0;
+    }
+
+    print_response_message(response);
+    return -1;
+}
+
+// Handle DOWNLOAD command: download file from peer
+// Format: DOWNLOAD <filename> 
+void handle_download(const char* peer_ip, int peer_port, const char* filename) {
+    long filesize = 0;
+    
+    // Connect and perform handshake to get file size
+    // initiate_p2p_handshake will send "DOWNLOAD <filename>"
+    int sock = initiate_p2p_handshake(peer_ip, peer_port, filename, &filesize);
+    
+    if (sock < 0) {
+        printf("[ERROR] Handshake failed. Peer might be offline or file missing.\n");
+        return;
+    }
+
+    // Step 2: Create a local file to write the binary data
+    FILE *fp = fopen(filename, "wb"); 
+    if (fp == NULL) {
+        perror("[ERROR] Could not create local file");
+        close(sock);
+        return;
+    }
+
+    printf("[P2P-INFO] Starting download: %s (%ld bytes)\n", filename, filesize);
+
+    char buffer[BUFF_SIZE];
+    long total_received = 0;
+    int n;
+
+    // Step 3: Receive data in chunks until the full file size is reached
+    while (total_received < filesize) {
+        n = recv(sock, buffer, sizeof(buffer), 0);
+        if (n <= 0) {
+            if (n < 0) perror("[ERROR] recv error");
+            break; // Connection lost or unexpected close
+        }
+
+        // Write the received chunk into the file
+        fwrite(buffer, 1, n, fp);
+        total_received += n;
+
+        // Visual progress update
+        printf("\r[P2P-INFO] Progress: %.2f%% (%ld/%ld bytes)", 
+               (double)total_received / filesize * 100, total_received, filesize);
+        fflush(stdout);
+    }
+
+    if (total_received == filesize) {
+        printf("\n[P2P-INFO] Download completed successfully!\n");
+    } else {
+        printf("\n[P2P-WARN] Download interrupted. File may be corrupted.\n");
+    }
+
+    fclose(fp);
+    close(sock);
+}
+
+// This function streams the actual file data to the downloader
+void handle_download_request(int peer_sock, const char* filename) {
+    FILE *fp = fopen(filename, "rb"); // Open file in binary read mode
+    if (fp == NULL) {
+        perror("[P2P-ERR] Failed to open file for reading");
+        return;
+    }
+
+    char buffer[BUFF_SIZE];
+    int bytes_read;
+
+    // Read the file chunk by chunk and send it through the socket
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        if (send_all(peer_sock, buffer, bytes_read) < 0) {
+            fprintf(stderr, "[P2P-ERR] Failed to send file data\n");
+            break;
+        }
+    }
+
+    printf("[P2P-INFO] Finished sending file: %s\n", filename);
+    fclose(fp);
+}
+
+
+// =============================================================================
+// SERVER CONNECTION
+// =============================================================================
+
+// Connect to the main server
+int connect_to_server(const char *server_ip, int server_port) {
+    // Implementation remains the same
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("[ERROR] Cannot create socket");
+        return -1;
+    }
+    
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    
+    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
+        perror("[ERROR] Invalid server IP address");
+        close(sock);
+        return -1;
+    }
+    
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("[ERROR] Cannot connect to server");
+        close(sock);
+        return -1;
+    }
+    
+    printf("[INFO] Connected to server %s:%d\n", server_ip, server_port);
+    return sock;
+}
+
+// Disconnect from the main server
+void disconnect_from_server(int sock) {
+    if (sock >= 0) {
+        close(sock);
+        printf("[INFO] Disconnected from server\n");
+    }
+}
+
+// =============================================================================
+// P2P CONNECTION FUNCTIONS
+// =============================================================================
+
+// Handle incoming P2P connection requests (Uploader side) 
+void* handle_p2p_request(void* arg) {
+    int peer_sock = *(int*)arg; // Extract the peer socket from arguments
+    free(arg);                  // Free the allocated memory for the socket pointer
+    char line[BUFF_SIZE];
+    
+    // Read the command line from the downloader (e.g., "DOWNLOAD filename.txt")
+    if (read_line(peer_sock, line, sizeof(line)) > 0) {
+        printf("\n[P2P] Incoming message: %s\n", line);
+        
+        char command[16], filename[256];
+        // Parse the message to extract command and filename
+        if (sscanf(line, "%s %s", command, filename) == 2 && strcmp(command, "DOWNLOAD") == 0) {
+            
+            struct stat st;
+            // Check if the file exists on the local disk
+            if (stat(filename, &st) == 0) {
+                char response[128];
+                // Send success handshake with file size back to downloader
+                snprintf(response, sizeof(response), "FILE_OK %ld\r\n", st.st_size);
+                send_all(peer_sock, response, strlen(response));
+                
+                // Automatically start streaming file data
+                handle_download_request(peer_sock, filename);
+            } else {
+                // Respond with error if the file is not found locally
+                const char* err = "FILE_NOT_FOUND\r\n";
+                send_all(peer_sock, err, strlen(err));
+                printf("[P2P-WARN] Requested file not found: %s\n", filename);
+            }
+        }
+    }
+    
+    // Close the connection once the transfer is finished or an error occurs
+    close(peer_sock);
+    return NULL;
+}
+
+/* Background thread to listen for P2P connections on port 6000 */
+void* p2p_listener_thread(void* arg) {
+    int server_fd, *new_sock;
+    struct sockaddr_in address;
+    int opt = 1;
+    int addrlen = sizeof(address);
+
+    // Create a TCP socket for listening
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) return NULL;
+    
+    // Set socket options to allow immediate reuse of the port after restart
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY; // Listen on all available network interfaces
+    address.sin_port = htons(P2P_PORT);    // Standard P2P port (6000)
+
+    // Bind the socket to the port
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) return NULL;
+    
+    // Start listening for incoming connections (queue up to 10 clients)
+    if (listen(server_fd, 10) < 0) return NULL;
+
+    printf("[P2P] Listener started on port %d\n", P2P_PORT);
+
+    while (1) {
+        new_sock = malloc(sizeof(int));
+        // Accept a new connection from a peer
+        *new_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+        if (*new_sock >= 0) {
+            pthread_t tid;
+            // Create a dedicated thread to handle each peer so the listener doesn't block
+            pthread_create(&tid, NULL, handle_p2p_request, (void*)new_sock);
+            pthread_detach(tid); // Automatically reclaim thread resources when finished
+        } else {
+            free(new_sock);
+        }
+    }
+    return NULL;
+}
+
+/* Connect to a peer and perform handshake for downloading (Downloader side) */
+int initiate_p2p_handshake(const char* peer_ip, int peer_port, const char* filename, long *filesize_out) {
+    int sock = 0;
+    struct sockaddr_in peer_addr;
+    char response[BUFF_SIZE];
+    char command[512];
+
+    // Create a TCP socket for the outbound connection
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) return -1;
+
+    peer_addr.sin_family = AF_INET;
+    peer_addr.sin_port = htons(peer_port);
+    inet_pton(AF_INET, peer_ip, &peer_addr.sin_addr); // Convert string IP to binary format
+
+    // Attempt to connect to the target Peer's IP and Port
+    if (connect(sock, (struct sockaddr *)&peer_addr, sizeof(peer_addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    // Prepare and send the DOWNLOAD command to start the handshake
+    snprintf(command, sizeof(command), "DOWNLOAD %s\r\n", filename);
+    if (send_all(sock, command, strlen(command)) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    // Read the response from the Peer to confirm if the file is available
+    if (read_line(sock, response, sizeof(response)) <= 0) {
+        close(sock);
+        return -1;
+    }
+
+    // If the peer responds with FILE_OK, parse the file size and return the socket
+    if (strncmp(response, "FILE_OK", 7) == 0) {
+        sscanf(response, "FILE_OK %ld", filesize_out);
+        return sock; // Handshake successful: return the active socket for downloading
+    }
+
+    printf("[ERROR] Handshake failed. Peer says: %s\n", response);
+    close(sock);
+    return -1;
+}
+
+// Main program loop
+int main(int argc, char *argv[]) {
+    init_client_state();
     load_shared_files();
-    
-    printf("[INFO] P2P Client initialized successfully\n");
-    printf("[INFO] Client ID: %u\n", g_client.client_id);
-    printf("[INFO] P2P Port: %d\n", g_client.p2p_port);
-    printf("[INFO] Shared files: %d\n", g_shared_files.count);
-    
+    start_gui(argc, argv);
     return 0;
 }
