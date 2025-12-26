@@ -1,0 +1,1 @@
+logs.txt|/home/admin/project/server/logs.txt
