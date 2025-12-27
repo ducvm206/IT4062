@@ -1,1 +1,1 @@
-logs.txt|/home/admin/project/server/logs.txt
+server.c|/home/admin/project/server/server.c

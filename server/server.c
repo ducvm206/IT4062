@@ -491,7 +491,7 @@ void handle_search(Session *session, const char *filename) {
         "SELECT DISTINCT c.client_id, c.ip_address, c.port "
         "FROM files f "
         "JOIN clients c ON f.client_id = c.client_id "
-        "WHERE f.filename = ?;";
+        "WHERE f.filename LIKE CONCAT('%', ?, '%');";
 
     pthread_mutex_lock(&db_mutex); // Lock database for thread safety
     MYSQL_STMT *stmt = mysql_stmt_init(db);
@@ -934,57 +934,47 @@ void handle_login(Session *session, const char *username, const char *password)
     }
 }
 
-void handle_publish(Session *session, const char *filename) {
+void handle_publish(Session *session, const char *filename, long filesize)
+{
     char query[BUFF_SIZE];
-    MYSQL *conn = mysql_init(NULL);
-    if (!conn) {
-        send_response(session->socket_fd, "500\r\n");
+
+    if (!session->is_logged_in) {
+        send_response(session->socket_fd, "401\r\n");
         return;
     }
-    
-    if (!mysql_real_connect(conn,
+
+    MYSQL *conn = mysql_init(NULL);
+    if (!conn ||
+        !mysql_real_connect(conn,
             MYSQL_HOST,
             MYSQL_USER,
             MYSQL_PASSWORD,
             MYSQL_DATABASE,
-            0,          // port = 0 → dùng mặc định
-            NULL,
-            0))
+            0, NULL, 0))
     {
         send_response(session->socket_fd, "500\r\n");
-        mysql_close(conn);
-        return;
-    }
-    // Check if the client is logged in before allowing publish
-    if (!session->is_logged_in) {
-        send_all(session->socket_fd, "401 Unauthorized: Please login first\r\n", 39);
         return;
     }
 
-    // Insert or Update the file record in the database
-    // We associate the filename with the account_id of the current session
     snprintf(query, sizeof(query),
         "INSERT INTO files (client_id, filename, filesize) "
-        "VALUES (%u, '%s', %ld) "
-        "ON DUPLICATE KEY UPDATE "
-        "filesize = VALUES(filesize), "
-        "published_at = CURRENT_TIMESTAMP",
+        "VALUES (%u, '%s', %ld)",
         session->client_id,
         filename,
-        0L  // Assuming filesize is 0 for now; modify as needed
+        filesize
     );
 
     if (mysql_query(conn, query)) {
         fprintf(stderr, "[DB-ERR] Publish failed: %s\n", mysql_error(conn));
-        send_all(session->socket_fd, "500 Internal Server Error\r\n", 27);
-        log_server("ERR", "PUBLISH", session, "500");
+        send_response(session->socket_fd, "500\r\n");
     } else {
-        printf("[SERVER] Client %d published file: %s\n", session->account_id, filename);
-        // Respond with 200 OK
-        send_all(session->socket_fd, "200 File published successfully\r\n", 33);
+        send_response(session->socket_fd, "200\r\n");
         log_server("OK", "PUBLISH", session, "200");
     }
+
+    mysql_close(conn);
 }
+
 
 void handle_unpublish(Session *session, const char *filename) {
     char query[BUFF_SIZE];
@@ -1166,9 +1156,16 @@ void *session_loop(void *arg)
         
         // 3. Handle P2P FILE INDEXING commands (Requires Login)
         else if (strcmp(command, "PUBLISH") == 0) {
+            char filename[256];
+            long filesize;
+            if (sscanf(payload, "%255s %ld", filename, &filesize) != 2) {
+                send_response(session->socket_fd, "300\r\n");
+                printf("[DEBUG-SESSION] ERROR: Invalid PUBLISH format\n");
+                continue;
+            }
             printf("[DEBUG-SESSION] Processing PUBLISH: %s\n", payload);
             printf("[DEBUG-SESSION] Session logged in: %d\n", session->is_logged_in);
-            handle_publish(session, payload);
+            handle_publish(session, filename, filesize);
         }
         else if (strcmp(command, "UNPUBLISH") == 0) {
             printf("[DEBUG-SESSION] Processing UNPUBLISH: %s\n", payload);
