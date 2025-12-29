@@ -22,36 +22,12 @@
 
 #define SERVER_PORT 8000
 #define BUFF_SIZE 8192
-#define MAX_CLIENTS 128
-#define MAX_TOTAL_FILES 4096
+#define MAX_CLIENTS 1024
 #define INDEX_FILE "index.txt"
 #define PASSWORD_HASH_LENGTH 65
 #define LOG_FILE "logs.txt"
 
-// Protocol response codes matching client expectations
-#define CODE_WELCOME 100
-#define CODE_REGISTER_SUCCESS 101
-#define CODE_LOGIN_SUCCESS 102
-#define CODE_INFO_ACCEPTED 103
-#define CODE_LOGOUT_SUCCESS 104
-#define CODE_PUBLISH_SUCCESS 201
-#define CODE_UNPUBLISH_SUCCESS 202
-#define CODE_SEARCH_SUCCESS 210
-#define CODE_DOWNLOAD_STARTED 211
-#define CODE_FILE_LIST_RETRIEVED 212
-#define CODE_DOWNLOAD_SUCCESS 220
-#define CODE_INVALID_FORMAT 300
-#define CODE_INVALID_PORT 301
-#define CODE_REGISTER_ERROR 400
-#define CODE_LOGIN_ERROR 401
-#define CODE_INVALID_FILENAME 402
-#define CODE_NOT_LOGGED_IN 403
-#define CODE_FILE_NOT_FOUND 404
-#define CODE_CLIENT_ID_EXISTS 405
-#define CODE_DOWNLOAD_FAILED 410
-#define CODE_SERVER_ERROR 500
 
-// MySQL connection parameters
 #define MYSQL_HOST "localhost"
 #define MYSQL_USER "p2puser"
 #define MYSQL_PASSWORD "p2ppass"
@@ -121,20 +97,15 @@ pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
    ============================================================================= */
 
 // Hash password using SHA256 algorithm
-// Parameters:
-//   password: Plain text password to hash
-//   hash_output: Buffer to store the resulting hex string (must be at least 65 bytes)
 void hash_password(const char *password, char *hash_output)
 {
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256_CTX sha256;
     
-    // Initialize SHA256 context and compute hash
     SHA256_Init(&sha256);
     SHA256_Update(&sha256, password, strlen(password));
     SHA256_Final(hash, &sha256);
     
-    // Convert binary hash to hexadecimal string
     for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
     {
         sprintf(hash_output + (i * 2), "%02x", hash[i]);
@@ -143,9 +114,6 @@ void hash_password(const char *password, char *hash_output)
 }
 
 // Send a response string to a client socket
-// Parameters:
-//   socket_fd: Destination socket file descriptor
-//   response: Null-terminated string to send
 void send_response(int socket_fd, const char *response)
 {
     // Simple send - assumes complete transmission (no partial send handling)
@@ -153,10 +121,6 @@ void send_response(int socket_fd, const char *response)
 }
 
 // Find the position of "\r\n" (CRLF) in a buffer
-// Parameters:
-//   buf: Buffer to search
-//   len: Length of data in buffer
-// Returns: Index of '\r' if found, -1 if not found
 ssize_t find_crlf(const char *buf, size_t len)
 {
     if (len < 2)
@@ -170,11 +134,6 @@ ssize_t find_crlf(const char *buf, size_t len)
 }
 
 // Send all data in buffer, handling partial sends
-// Parameters:
-//   sockfd: Socket file descriptor
-//   buf: Buffer containing data to send
-//   len: Length of data to send
-// Returns: 0 on success, -1 on error
 int send_all(int sockfd, const char *buf, size_t len)
 {
     size_t total_sent = 0;
@@ -196,11 +155,6 @@ int send_all(int sockfd, const char *buf, size_t len)
 }
 
 // Read a line ending with newline from socket
-// Parameters:
-//   sockfd: Socket file descriptor
-//   buf: Buffer to store the line
-//   maxlen: Maximum buffer size
-// Returns: Number of bytes read, -1 on error
 int read_line(int sockfd, char *buf, size_t maxlen)
 {
     size_t i = 0;
@@ -337,7 +291,6 @@ int init_database()
         "file_id INT AUTO_INCREMENT PRIMARY KEY,"
         "client_id INT UNSIGNED NOT NULL,"
         "filename VARCHAR(255) NOT NULL,"
-        "filesize BIGINT NOT NULL,"
         "published_at DATETIME DEFAULT CURRENT_TIMESTAMP,"
         "FOREIGN KEY (client_id) REFERENCES clients(client_id) ON DELETE CASCADE,"
         "INDEX idx_files_filename (filename)"
@@ -364,7 +317,6 @@ int update_client_info(uint32_t client_id, int account_id, const char *ip, int p
     printf("[DEBUG-UPDATE_CLIENT_INFO] ClientID: %u, AccountID: %d, IP: %s, Port: %d\n", 
            client_id, account_id, ip, port);
     
-    // SQL query to insert or update client info if ID already exists
     const char *query = 
         "INSERT INTO clients (client_id, account_id, ip_address, port, last_seen) "
         "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
@@ -397,39 +349,29 @@ int update_client_info(uint32_t client_id, int account_id, const char *ip, int p
     
     printf("[DEBUG-UPDATE_CLIENT_INFO] SQL statement prepared\n");
 
-    // Bind parameters: client_id, account_id, ip_address, port
     MYSQL_BIND bind[4];
     memset(bind, 0, sizeof(bind));
 
-    bind[0].buffer_type = MYSQL_TYPE_LONG; // client_id (uint32)
+    bind[0].buffer_type = MYSQL_TYPE_LONG; 
     bind[0].buffer = (void*)&client_id;
 
-    bind[1].buffer_type = MYSQL_TYPE_LONG; // account_id
+    bind[1].buffer_type = MYSQL_TYPE_LONG; 
     bind[1].buffer = (void*)&account_id;
 
-    bind[2].buffer_type = MYSQL_TYPE_STRING; // ip_address
+    bind[2].buffer_type = MYSQL_TYPE_STRING; 
     bind[2].buffer = (void*)ip;
     bind[2].buffer_length = strlen(ip);
 
-    bind[3].buffer_type = MYSQL_TYPE_LONG; // p2p_port
+    bind[3].buffer_type = MYSQL_TYPE_LONG; 
     bind[3].buffer = (void*)&port;
-    
-    printf("[DEBUG-UPDATE_CLIENT_INFO] Parameters bound\n");
 
     if (mysql_stmt_bind_param(stmt, bind)) {
-        printf("[DEBUG-UPDATE_CLIENT_INFO] ERROR: Failed to bind parameters\n");
         status = -1;
         goto cleanup;
     }
 
-    printf("[DEBUG-UPDATE_CLIENT_INFO] Executing SQL statement...\n");
     if (mysql_stmt_execute(stmt)) {
-        fprintf(stderr, "[ERROR] SQL error on update_client_info execute: %s\n", mysql_stmt_error(stmt));
-        printf("[DEBUG-UPDATE_CLIENT_INFO] ERROR: Failed to execute statement\n");
         status = -1;
-    } else {
-        printf("[DEBUG-UPDATE_CLIENT_INFO] SUCCESS: SQL statement executed successfully\n");
-        printf("[DEBUG-UPDATE_CLIENT_INFO] Client info inserted/updated in 'clients' table\n");
     }
 
 cleanup:
@@ -439,11 +381,6 @@ cleanup:
 }
 
 // Retrieve client connection information by client ID
-// Parameters:
-//   client_id: Client ID to look up
-//   ip_address: Output buffer for IP address
-//   port: Output pointer for port number
-// Returns: 1 if found, 0 if not found
 int get_client_info(uint32_t client_id, char *ip_address, int *port)
 {
     pthread_mutex_lock(&client_mutex);
@@ -471,17 +408,14 @@ int get_client_info(uint32_t client_id, char *ip_address, int *port)
 // Handle SENDINFO command from client
 // Command format: SENDINFO <ClientID> <Port>
 void handle_sendinfo(Session *session, uint32_t client_id, int p2p_port) {
-    // Authorization check - user must be logged in
     if (!session->is_logged_in) {
-        send_response(session->socket_fd, "403\r\n"); // Not logged in
+        send_response(session->socket_fd, "403\r\n"); 
         log_server("ERR", "SENDINFO", session, "403");
-        printf("[DEBUG-SENDINFO] Client NOT logged in, rejecting SENDINFO for ClientID: %u\n", client_id);
         return;
     }
 
-    // Validate port number
     if (p2p_port <= 0 || p2p_port > 65535) {
-        send_response(session->socket_fd, "301\r\n"); // Invalid port number
+        send_response(session->socket_fd, "301\r\n"); 
         log_server("ERR", "SENDINFO", session, "301");
         return;
     }
@@ -490,43 +424,22 @@ void handle_sendinfo(Session *session, uint32_t client_id, int p2p_port) {
     char *client_ip = inet_ntoa(session->client_addr.sin_addr);
     session->client_id = client_id;
 
-    printf("[DEBUG-SENDINFO] Attempting to update client info:\n");
-    printf("[DEBUG-SENDINFO]   ClientID: %u\n", client_id);
-    printf("[DEBUG-SENDINFO]   AccountID: %d\n", session->account_id);
-    printf("[DEBUG-SENDINFO]   Username: %s\n", session->username);
-    printf("[DEBUG-SENDINFO]   IP: %s\n", client_ip);
-    printf("[DEBUG-SENDINFO]   P2P Port: %d\n", p2p_port);
-    printf("[DEBUG-SENDINFO]   Socket FD: %d\n", session->socket_fd);
-
     // Update MySQL database
     if (update_client_info(client_id, session->account_id, client_ip, p2p_port) != 0) {
-        send_response(session->socket_fd, "500\r\n"); // Internal Server Error
-        printf("[DEBUG-SENDINFO] ERROR: Failed to update client info in database!\n");
+        send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "SENDINFO", session, "500");
         return;
     }
 
-    send_response(session->socket_fd, "103\r\n"); // 103: Information accepted
-    
-    printf("[DEBUG-SENDINFO] SUCCESS: Client info updated in database!\n");
-    printf("[INFO] Client %u updated info: IP=%s, P2P_Port=%d\n", client_id, client_ip, p2p_port);
+    send_response(session->socket_fd, "103\r\n"); 
     log_server("OK", "SENDINFO", session, "103");
 }
 
 // Handle SEARCH command from client
-// Command format: SEARCH <Filename>
 void handle_search(Session *session, const char *filename) {
-    // Authorization check: Clients must be logged in to perform a search
     if (!session->is_logged_in) {
-        send_response(session->socket_fd, "403\r\n"); // Not logged in
+        send_response(session->socket_fd, "403\r\n"); 
         log_server("ERR", "SEARCH", session, "403");
-        return;
-    }
-
-    // Validate filename
-    if (strlen(filename) == 0 || strlen(filename) > 255) {
-        send_response(session->socket_fd, "402\r\n"); // Invalid filename
-        log_server("ERR", "SEARCH", session, "402");
         return;
     }
 
@@ -537,17 +450,16 @@ void handle_search(Session *session, const char *filename) {
         "JOIN clients c ON f.client_id = c.client_id "
         "WHERE f.filename LIKE CONCAT('%', ?, '%');";
 
-    pthread_mutex_lock(&db_mutex); // Lock database for thread safety
+    pthread_mutex_lock(&db_mutex); 
     MYSQL_STMT *stmt = mysql_stmt_init(db);
     if (!stmt) {
         pthread_mutex_unlock(&db_mutex);
-        send_response(session->socket_fd, "500\r\n"); // Internal Server Error
+        send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "SEARCH", session, "500");
         return;
     }
 
     if (mysql_stmt_prepare(stmt, query, strlen(query)) != 0) {
-        fprintf(stderr, "[ERROR] MySQL stmt prepare failed: %s\n", mysql_stmt_error(stmt));
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
@@ -567,7 +479,6 @@ void handle_search(Session *session, const char *filename) {
     mysql_stmt_bind_param(stmt, &bind_param);
 
     if (mysql_stmt_execute(stmt) != 0) {
-        fprintf(stderr, "[ERROR] MySQL stmt execute failed: %s\n", mysql_stmt_error(stmt));
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
@@ -602,29 +513,20 @@ void handle_search(Session *session, const char *filename) {
 
     // Response Processing: Filter by active sessions and send to client
     if (file_found_in_db > 0) {
-        // Send success code (210: File found, peer list follows)
         send_response(session->socket_fd, "210\r\n");
         log_server("OK", "SEARCH", session, "210");
 
         char peer_line[256];
         int online_peers = 0;
         
-        // Fetch each potential peer from DB
         while (mysql_stmt_fetch(stmt) == 0) {
             res_ip[res_ip_len] = '\0'; 
-            
-            // CROSS-CHECK: Ensure this peer is currently ONLINE in active sessions
             pthread_mutex_lock(&session_mutex);
             for (int i = 0; i < MAX_CLIENTS; i++) {
                 if (sessions[i].is_active && sessions[i].client_id == res_client_id) {
-                    
-                    // Use the current real-time IP from the socket connection
                     char *current_ip = inet_ntoa(sessions[i].client_addr.sin_addr);
-                    
-                    // Format: "ClientID IP Port\r\n"
                     int p_len = snprintf(peer_line, sizeof(peer_line), "%u %s %d\r\n", 
                                          res_client_id, current_ip, res_port);
-                    
                     send(session->socket_fd, peer_line, p_len, 0);
                     online_peers++;
                     break;
@@ -632,26 +534,18 @@ void handle_search(Session *session, const char *filename) {
             }
             pthread_mutex_unlock(&session_mutex);
         }
-
-        // TERMINATION: Send a blank line to signify the end of the 210 list
         send(session->socket_fd, "\r\n", 2, 0); 
-
-        printf("[INFO] SEARCH: Found '%s' at %d online peers.\n", filename, online_peers);
         log_server("OK", "SEARCH", session, "210");
     } else {
-        // 404: No one in the database has this file
         send_response(session->socket_fd, "404\r\n");
         log_server("OK", "SEARCH", session, "404");
     }
-
-    // Resource Cleanup
     mysql_stmt_free_result(stmt);
     mysql_stmt_close(stmt);
     pthread_mutex_unlock(&db_mutex);
 }
 
 // Handle REGISTER command from client
-// Command format: REGISTER username password
 void handle_register(Session *session, const char *username, const char *password)
 {
     // Check password length (minimum 6 characters)
@@ -662,13 +556,11 @@ void handle_register(Session *session, const char *username, const char *passwor
         return;
     }
     
-    // Check if username already exists
     pthread_mutex_lock(&db_mutex);
     
     MYSQL_STMT *stmt = mysql_stmt_init(db);
     if (stmt == NULL)
     {
-        fprintf(stderr, "[ERROR] Cannot initialize MySQL statement: %s\n", mysql_error(db));
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "REGISTER", session, "500");
@@ -679,7 +571,6 @@ void handle_register(Session *session, const char *username, const char *passwor
     
     if (mysql_stmt_prepare(stmt, check_sql, strlen(check_sql)) != 0)
     {
-        fprintf(stderr, "[ERROR] SQL error on REGISTER check prepare: %s\n", mysql_stmt_error(stmt));
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
@@ -705,7 +596,6 @@ void handle_register(Session *session, const char *username, const char *passwor
         return;
     }
     
-    // Execute query
     if (mysql_stmt_execute(stmt) != 0)
     {
         fprintf(stderr, "[ERROR] SQL error on REGISTER check execute: %s\n", mysql_stmt_error(stmt));
@@ -716,27 +606,22 @@ void handle_register(Session *session, const char *username, const char *passwor
         return;
     }
     
-    // Store result
     mysql_stmt_store_result(stmt);
     
     // Check if username already exists
     if (mysql_stmt_num_rows(stmt) > 0)
     {
-        // Username already exists
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "400\r\n");
         log_server("ERR", "REGISTER", session, "400");
         return;
     }
-    
     mysql_stmt_close(stmt);
     
-    // Hash password
     char password_hash[PASSWORD_HASH_LENGTH];
     hash_password(password, password_hash);
     
-    // Insert new account into database
     stmt = mysql_stmt_init(db);
     if (stmt == NULL)
     {
@@ -777,7 +662,6 @@ void handle_register(Session *session, const char *username, const char *passwor
     
     if (mysql_stmt_bind_param(stmt, bind_params) != 0)
     {
-        fprintf(stderr, "[ERROR] SQL error on REGISTER insert bind: %s\n", mysql_stmt_error(stmt));
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
@@ -792,14 +676,12 @@ void handle_register(Session *session, const char *username, const char *passwor
         unsigned int err_no = mysql_stmt_errno(stmt);
         if (err_no == 1062) // ER_DUP_ENTRY
         {
-            fprintf(stderr, "[ERROR] Username already exists: %s\n", username);
             mysql_stmt_close(stmt);
             pthread_mutex_unlock(&db_mutex);
             send_response(session->socket_fd, "400\r\n");
             log_server("ERR", "REGISTER", session, "400");
             return;
         }
-        fprintf(stderr, "[ERROR] SQL error on REGISTER insert execute: %s\n", mysql_stmt_error(stmt));
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
@@ -813,20 +695,15 @@ void handle_register(Session *session, const char *username, const char *passwor
     // Send success response
     send_response(session->socket_fd, "101\r\n");
     log_server("OK", "REGISTER", session, "101");
-    printf("[INFO] New account registered: username=%s\n", username);
 }
 
 // Handle LOGIN command from client
-// Command format: LOGIN username password
 void handle_login(Session *session, const char *username, const char *password)
 {
-    // Hash password for comparison
     char password_hash[PASSWORD_HASH_LENGTH];
     hash_password(password, password_hash);
     
-    // Find account in database
     pthread_mutex_lock(&db_mutex);
-    
     MYSQL_STMT *stmt = mysql_stmt_init(db);
     if (stmt == NULL)
     {
@@ -976,8 +853,7 @@ void handle_login(Session *session, const char *username, const char *password)
 }
 
 // Handle PUBLISH command from client
-// Command format: PUBLISH <filename> <filesize>
-void handle_publish(Session *session, const char *filename, long filesize)
+void handle_publish(Session *session, const char *filename)
 {
     char query[BUFF_SIZE];
 
@@ -992,13 +868,6 @@ void handle_publish(Session *session, const char *filename, long filesize)
     if (strlen(filename) == 0 || strlen(filename) > 255) {
         send_response(session->socket_fd, "402\r\n"); // Invalid filename
         log_server("ERR", "PUBLISH", session, "402");
-        return;
-    }
-
-    // Validate filesize
-    if (filesize <= 0) {
-        send_response(session->socket_fd, "300\r\n"); // Invalid format
-        log_server("ERR", "PUBLISH", session, "300");
         return;
     }
 
@@ -1017,13 +886,12 @@ void handle_publish(Session *session, const char *filename, long filesize)
         return;
     }
 
-    // Prepare and execute SQL query
+    // Prepare and execute SQL query (NO filesize column)
     snprintf(query, sizeof(query),
-        "INSERT INTO files (client_id, filename, filesize) "
-        "VALUES (%u, '%s', %ld)",
+        "INSERT INTO files (client_id, filename) "
+        "VALUES (%u, '%s')",
         session->client_id,
-        filename,
-        filesize
+        filename
     );
 
     if (mysql_query(conn, query)) {
@@ -1031,7 +899,7 @@ void handle_publish(Session *session, const char *filename, long filesize)
         send_response(session->socket_fd, "500\r\n"); // Server error
         log_server("ERR", "PUBLISH", session, "500");
     } else {
-        send_response(session->socket_fd, "201\r\n"); // Publish successful (changed from 200 to 201)
+        send_response(session->socket_fd, "201\r\n"); // Publish successful
         log_server("OK", "PUBLISH", session, "201");
         printf("[INFO] File published: %s by client %u\n", filename, session->client_id);
     }
@@ -1103,6 +971,48 @@ void handle_unpublish(Session *session, const char *filename) {
     }
     
     mysql_close(conn);
+}
+
+void handle_update_status(Session *session, int status_code, const char *filename) {
+    // Authorization check
+    if (!session->is_logged_in) {
+        send_response(session->socket_fd, "403\r\n");
+        log_server("ERR", "UPDATE_STATUS", session, "403");
+        return;
+    }
+    
+    // Validate status code (only accept 220 or 410)
+    if (status_code != 220 && status_code != 410) {
+        send_response(session->socket_fd, "300\r\n");
+        log_server("ERR", "UPDATE_STATUS", session, "300");
+        return;
+    }
+    
+    // Validate filename
+    if (strlen(filename) == 0 || strlen(filename) > 255) {
+        send_response(session->socket_fd, "300\r\n");
+        log_server("ERR", "UPDATE_STATUS", session, "300");
+        return;
+    }
+    
+    // Log the status update to console and log file
+    char status_str[16];
+    if (status_code == 220) {
+        strcpy(status_str, "DOWNLOAD_SUCCESS");
+    } else {
+        strcpy(status_str, "DOWNLOAD_FAILED");
+    }
+    
+    printf("[STATUS] Client %u (%s) reported %s for file: %s\n", 
+           session->client_id, session->username, status_str, filename);
+    
+    // Log to server log file
+    char log_code[16];
+    snprintf(log_code, sizeof(log_code), "%d", status_code);
+    log_server("STATUS", "UPDATE_STATUS", session, log_code);
+    
+    // Send success response
+    send_response(session->socket_fd, "220\r\n");
 }
 
 // Handle LOGOUT command from client
@@ -1231,16 +1141,17 @@ void *session_loop(void *arg)
         // Handle P2P FILE INDEXING commands (Requires Login)
         else if (strcmp(command, "PUBLISH") == 0) {
             char filename[256];
-            long filesize;
-            if (sscanf(payload, "%255s %ld", filename, &filesize) != 2) {
+            // Parse without filesize
+            if (sscanf(payload, "%255s", filename) != 1) {
                 send_response(session->socket_fd, "300\r\n"); // Invalid format
                 printf("[DEBUG-SESSION] ERROR: Invalid PUBLISH format\n");
                 continue;
             }
             printf("[DEBUG-SESSION] Processing PUBLISH: %s\n", payload);
             printf("[DEBUG-SESSION] Session logged in: %d\n", session->is_logged_in);
-            handle_publish(session, filename, filesize);
+            handle_publish(session, filename);
         }
+        
         else if (strcmp(command, "UNPUBLISH") == 0) {
             printf("[DEBUG-SESSION] Processing UNPUBLISH: %s\n", payload);
             printf("[DEBUG-SESSION] Session logged in: %d\n", session->is_logged_in);
@@ -1254,24 +1165,18 @@ void *session_loop(void *arg)
             handle_search(session, payload);
         }
 
-        // Handle DOWNLOAD STATUS updates
+        // Handle UPDATE_STATUS command
         else if (strcmp(command, "UPDATE_STATUS") == 0) {
             int status_code;
             char filename[256];
-            if (sscanf(payload, "%d %s", &status_code, filename) == 2) {
-                if (status_code == 220) {
-                    printf("[STATUS] Client %d successfully downloaded: %s\n", session->account_id, filename);
-                    send_all(session->socket_fd, "220\r\n", 5); // Download successful
-                    log_server("OK", "DOWNLOAD", session, "220");
-                } else if (status_code == 410) {
-                    printf("[STATUS] Client %d failed to download: %s\n", session->account_id, filename);
-                    send_all(session->socket_fd, "410\r\n", 5); // Download failed
-                    log_server("ERR", "DOWNLOAD", session, "410");
-                } else {
-                    send_all(session->socket_fd, "300\r\n", 5); // Invalid format
-                }
+            if (sscanf(payload, "%d %255s", &status_code, filename) == 2) {
+                printf("[DEBUG-SESSION] Processing UPDATE_STATUS: status=%d, file=%s\n", 
+                    status_code, filename);
+                handle_update_status(session, status_code, filename);
             } else {
-                send_all(session->socket_fd, "300\r\n", 5); // Invalid format
+                send_response(session->socket_fd, "300\r\n");
+                log_server("ERR", "UPDATE_STATUS", session, "300");
+                printf("[DEBUG-SESSION] Invalid UPDATE_STATUS format: %s\n", payload);
             }
         }
 
@@ -1400,10 +1305,8 @@ int accept_client_connection(int listenfd, struct sockaddr_in *client_addr, sock
 
 int main()
 {
-    // Initialize accounts database
     if (init_database() != 0)
     {
-        fprintf(stderr, "[ERROR] Failed to initialize accounts database\n");
         return EXIT_FAILURE;
     }
     

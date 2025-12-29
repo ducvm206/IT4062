@@ -1,1 +1,1 @@
-news_snippet.txt|./shared/news_snippet.txt
+oppenheimer.txt|./shared/oppenheimer.txt
