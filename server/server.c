@@ -188,13 +188,7 @@ int read_line(int sockfd, char *buf, size_t maxlen)
 }
 
 // Logs client transaction activity to a file (logs.txt).
-// Format: [Timestamp] STATUS COMMAND CID=ClientID USER=Username IP=IP:Port CODE=ResponseCode
-void log_server(
-    const char *status,
-    const char *command,
-    Session *s,
-    const char *code
-) {
+void log_server(const char *status, const char *command, Session *s, const char *code) { 
     char timebuf[32];
     time_t now = time(NULL);
     strftime(timebuf, sizeof(timebuf),
@@ -408,12 +402,6 @@ int get_client_info(uint32_t client_id, char *ip_address, int *port)
 // Handle SENDINFO command from client
 // Command format: SENDINFO <ClientID> <Port>
 void handle_sendinfo(Session *session, uint32_t client_id, int p2p_port) {
-    if (!session->is_logged_in) {
-        send_response(session->socket_fd, "403\r\n"); 
-        log_server("ERR", "SENDINFO", session, "403");
-        return;
-    }
-
     if (p2p_port <= 0 || p2p_port > 65535) {
         send_response(session->socket_fd, "301\r\n"); 
         log_server("ERR", "SENDINFO", session, "301");

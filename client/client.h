@@ -39,7 +39,6 @@ typedef struct {
     char ip_address[16];
     int port;
     char filename[256];
-    long filesize; /* optional: not filled by SEARCH */
 } PeerInfo;
 
 extern ClientState g_client;

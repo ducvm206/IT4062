@@ -34,11 +34,6 @@ typedef struct {
     PeerInfo peers[MAX_PEERS];
 } SearchResult;
 
-typedef struct {
-    char buf[BUFFER_SIZE];
-    int len;
-} LineBuffer;
-
 // Global client variable
 ClientState g_client;
 SharedFileList g_shared_files = {0};
@@ -350,46 +345,6 @@ int read_line(int sock, char *line, int maxlen) {
     return i;
 }
 
-int read_line_nb(int sock, LineBuffer *lb, char *out, int out_sz, int timeout_sec) {
-    fd_set rfds;
-    struct timeval tv;
-
-    FD_ZERO(&rfds);
-    FD_SET(sock, &rfds);
-
-    tv.tv_sec = timeout_sec;
-    tv.tv_usec = 0;
-
-    int ret = select(sock + 1, &rfds, NULL, NULL, &tv);
-    if (ret <= 0) return 0;
-
-    if (FD_ISSET(sock, &rfds)) {
-        int n = recv(sock, lb->buf + lb->len,
-                     sizeof(lb->buf) - lb->len - 1, 0);
-        if (n <= 0) return -1;
-
-        lb->len += n;
-        lb->buf[lb->len] = '\0';
-
-        char *crlf = strstr(lb->buf, "\r\n");
-        if (!crlf) return 0;
-
-        int line_len = crlf - lb->buf;
-        if (line_len >= out_sz) line_len = out_sz - 1;
-
-        memcpy(out, lb->buf, line_len);
-        out[line_len] = '\0';
-
-        int remain = lb->len - (line_len + 2);
-        memmove(lb->buf, crlf + 2, remain);
-        lb->len = remain;
-
-        return 1;
-    }
-
-    return 0;
-}
-
 // Send command
 int send_command(int sock, const char *cmd, char *response, int resp_size) {
     if (send_all(sock, cmd, strlen(cmd)) < 0) {
@@ -413,10 +368,6 @@ int handle_sendinfo(int sock) {
     char command[512];
     char response[BUFFER_SIZE];
     int status_code;
-    
-    if (!g_client.is_logged_in) {
-        return -1;
-    }
 
     snprintf(command, sizeof(command), "SENDINFO %u %d\r\n", 
              g_client.client_id, g_client.p2p_port);
@@ -782,12 +733,25 @@ int connect_to_server(const char *server_ip, int server_port) {
     }
 
     char response[BUFFER_SIZE];
-    LineBuffer lb = {0};
+    int response_len = 0;
 
-    if (read_line_nb(sock, &lb, response, sizeof(response), 5) == 1) {
-        print_response_message(response);
+    fd_set read_fds;
+    struct timeval timeout;
+    FD_ZERO(&read_fds);
+    FD_SET(sock, &read_fds);
+
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+
+    if (select(sock + 1, &read_fds, NULL, NULL, &timeout) > 0 && FD_ISSET(sock, &read_fds)) {
+        response_len = read_line(sock, response, sizeof(response));
     }
 
+    if (response_len <= 0 || strncmp(response, "100", 3) != 0) {
+        close(sock);
+        return -1;
+    }
+    
     return sock;
 }
 
@@ -911,6 +875,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[ERROR] Failed to connect to server\n");
         return 1;
     }
+
+    // Send client info upon connection
+    handle_sendinfo(g_client.server_socket);
     
     g_client.is_logged_in = 0;
 
