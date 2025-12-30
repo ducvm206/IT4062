@@ -400,7 +400,6 @@ int get_client_info(uint32_t client_id, char *ip_address, int *port)
    ============================================================================= */
 
 // Handle SENDINFO command from client
-// Command format: SENDINFO <ClientID> <Port>
 void handle_sendinfo(Session *session, uint32_t client_id, int p2p_port) {
     if (p2p_port <= 0 || p2p_port > 65535) {
         send_response(session->socket_fd, "301\r\n"); 
@@ -412,7 +411,6 @@ void handle_sendinfo(Session *session, uint32_t client_id, int p2p_port) {
     char *client_ip = inet_ntoa(session->client_addr.sin_addr);
     session->client_id = client_id;
 
-    // Update MySQL database
     if (update_client_info(client_id, session->account_id, client_ip, p2p_port) != 0) {
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "SENDINFO", session, "500");
@@ -431,7 +429,6 @@ void handle_search(Session *session, const char *filename) {
         return;
     }
 
-    // Prepare SQL Query: Join files and clients to get initial peer info
     const char *query = 
         "SELECT DISTINCT c.client_id, c.ip_address, c.port "
         "FROM files f "
@@ -455,7 +452,6 @@ void handle_search(Session *session, const char *filename) {
         return;
     }
 
-    // Bind Parameters: Prevent SQL Injection by binding the filename
     MYSQL_BIND bind_param;
     memset(&bind_param, 0, sizeof(bind_param));
     unsigned long filename_len = strlen(filename);
@@ -474,7 +470,6 @@ void handle_search(Session *session, const char *filename) {
         return;
     }
 
-    // Bind Results: Map DB columns to local variables
     uint32_t res_client_id;
     char res_ip[16];
     int res_port;
@@ -528,6 +523,7 @@ void handle_search(Session *session, const char *filename) {
         send_response(session->socket_fd, "404\r\n");
         log_server("OK", "SEARCH", session, "404");
     }
+    
     mysql_stmt_free_result(stmt);
     mysql_stmt_close(stmt);
     pthread_mutex_unlock(&db_mutex);
@@ -896,28 +892,24 @@ void handle_publish(Session *session, const char *filename)
 }
 
 // Handle UNPUBLISH command from client
-// Command format: UNPUBLISH <filename>
 void handle_unpublish(Session *session, const char *filename) {
     char query[BUFF_SIZE];
 
-    // Authorization check
     if (!session->is_logged_in) {
-        send_all(session->socket_fd, "403\r\n", 5); // Not logged in
+        send_all(session->socket_fd, "403\r\n", 5); 
         log_server("ERR", "UNPUBLISH", session, "403");
         return;
     }
 
-    // Validate filename
-    if (strlen(filename) == 0 || strlen(filename) > 255) {
-        send_all(session->socket_fd, "402\r\n", 5); // Invalid filename
+    if (strlen(filename) == 0) {
+        send_all(session->socket_fd, "402\r\n", 5);
         log_server("ERR", "UNPUBLISH", session, "402");
         return;
     }
 
-    // Create database connection
     MYSQL *conn = mysql_init(NULL);
     if (!conn) {
-        send_response(session->socket_fd, "500\r\n"); // Server error
+        send_response(session->socket_fd, "500\r\n"); 
         log_server("ERR", "UNPUBLISH", session, "500");
         return;
     }
@@ -927,80 +919,35 @@ void handle_unpublish(Session *session, const char *filename) {
             MYSQL_USER,
             MYSQL_PASSWORD,
             MYSQL_DATABASE,
-            0,          // port = 0 → use default
+            0,          
             NULL,
             0))
     {
-        send_response(session->socket_fd, "500\r\n"); // Server error
+        send_response(session->socket_fd, "500\r\n"); 
         log_server("ERR", "UNPUBLISH", session, "500"); 
         mysql_close(conn);
         return;
     }
 
-    // Delete the file entry that matches both filename and this client's client_id
     snprintf(query, sizeof(query), 
              "DELETE FROM files WHERE client_id = %u AND filename = '%s'", 
              session->client_id, filename);
 
     if (mysql_query(conn, query)) {
         fprintf(stderr, "[DB-ERR] Unpublish failed: %s\n", mysql_error(conn));
-        send_all(session->socket_fd, "500\r\n", 5); // Server error
+        send_all(session->socket_fd, "500\r\n", 5); 
         log_server("ERR", "UNPUBLISH", session, "500");
     } else {
-        // Check if any row was actually deleted
         if (mysql_affected_rows(conn) > 0) {
             printf("[SERVER] Client %u unpublished file: %s\n", session->client_id, filename);
-            send_all(session->socket_fd, "202\r\n", 5); // Unpublish successful (changed from 200 to 202)
+            send_all(session->socket_fd, "202\r\n", 5); 
             log_server("OK", "UNPUBLISH", session, "202");
         } else {
-            send_all(session->socket_fd, "404\r\n", 5); // File not found
+            send_all(session->socket_fd, "404\r\n", 5); 
             log_server("ERR", "UNPUBLISH", session, "404");
         }
     }
-    
     mysql_close(conn);
-}
-
-void handle_update_status(Session *session, int status_code, const char *filename) {
-    // Authorization check
-    if (!session->is_logged_in) {
-        send_response(session->socket_fd, "403\r\n");
-        log_server("ERR", "UPDATE_STATUS", session, "403");
-        return;
-    }
-    
-    // Validate status code (only accept 220 or 410)
-    if (status_code != 220 && status_code != 410) {
-        send_response(session->socket_fd, "300\r\n");
-        log_server("ERR", "UPDATE_STATUS", session, "300");
-        return;
-    }
-    
-    // Validate filename
-    if (strlen(filename) == 0 || strlen(filename) > 255) {
-        send_response(session->socket_fd, "300\r\n");
-        log_server("ERR", "UPDATE_STATUS", session, "300");
-        return;
-    }
-    
-    // Log the status update to console and log file
-    char status_str[16];
-    if (status_code == 220) {
-        strcpy(status_str, "DOWNLOAD_SUCCESS");
-    } else {
-        strcpy(status_str, "DOWNLOAD_FAILED");
-    }
-    
-    printf("[STATUS] Client %u (%s) reported %s for file: %s\n", 
-           session->client_id, session->username, status_str, filename);
-    
-    // Log to server log file
-    char log_code[16];
-    snprintf(log_code, sizeof(log_code), "%d", status_code);
-    log_server("STATUS", "UPDATE_STATUS", session, log_code);
-    
-    // Send success response
-    send_response(session->socket_fd, "220\r\n");
 }
 
 // Handle LOGOUT command from client
