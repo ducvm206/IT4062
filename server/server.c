@@ -401,15 +401,23 @@ int get_client_info(uint32_t client_id, char *ip_address, int *port)
 
 // Handle SENDINFO command from client
 void handle_sendinfo(Session *session, uint32_t client_id, int p2p_port) {
+
     if (p2p_port <= 0 || p2p_port > 65535) {
         send_response(session->socket_fd, "301\r\n"); 
         log_server("ERR", "SENDINFO", session, "301");
         return;
     }
 
+    session->client_id = client_id;
+
+    if (!session->is_logged_in) {
+        send_response(session->socket_fd, "103\r\n");
+        log_server("OK", "SENDINFO", session, "103");
+        return;
+    }
+
     // Identify client IP from the connection socket
     char *client_ip = inet_ntoa(session->client_addr.sin_addr);
-    session->client_id = client_id;
 
     if (update_client_info(client_id, session->account_id, client_ip, p2p_port) != 0) {
         send_response(session->socket_fd, "500\r\n");
@@ -1098,21 +1106,6 @@ void *session_loop(void *arg)
             printf("[DEBUG-SESSION] Processing SEARCH: %s\n", payload);
             printf("[DEBUG-SESSION] Session logged in: %d\n", session->is_logged_in);
             handle_search(session, payload);
-        }
-
-        // Handle UPDATE_STATUS command
-        else if (strcmp(command, "UPDATE_STATUS") == 0) {
-            int status_code;
-            char filename[256];
-            if (sscanf(payload, "%d %255s", &status_code, filename) == 2) {
-                printf("[DEBUG-SESSION] Processing UPDATE_STATUS: status=%d, file=%s\n", 
-                    status_code, filename);
-                handle_update_status(session, status_code, filename);
-            } else {
-                send_response(session->socket_fd, "300\r\n");
-                log_server("ERR", "UPDATE_STATUS", session, "300");
-                printf("[DEBUG-SESSION] Invalid UPDATE_STATUS format: %s\n", payload);
-            }
         }
 
         // Handle LOGOUT command
