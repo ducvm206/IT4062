@@ -8,7 +8,7 @@ sudo apt install libgtk-3-dev
 1. Make
 make clean && make
 
-2. Copy binary client vao clientA va clientB
+2. Copy binary client vao clientA va clientB:
 cp client/client clientA/
 cp client/client clientB/
 

@@ -213,6 +213,112 @@ void log_server(const char *status, const char *command, Session *s, const char 
     pthread_mutex_unlock(&log_mutex);
 }
 
+int log_client_activity(uint32_t client_id, int account_id,
+                        const char *action, const char *target,
+                        const char *status, const char *ip_address,
+                        const char *details)
+{
+    pthread_mutex_lock(&db_mutex);
+ 
+    const char *sql =
+        "INSERT INTO activity_logs "
+        "(client_id, account_id, action, target, status, ip_address, details) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);";
+ 
+    MYSQL_STMT *stmt = mysql_stmt_init(db);
+    if (stmt == NULL)
+    {
+        fprintf(stderr, "[ERROR] Cannot init statement: %s\n", mysql_error(db));
+        pthread_mutex_unlock(&db_mutex);
+        return -1;
+    }
+ 
+    if (mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0)
+    {
+        fprintf(stderr, "[ERROR] Cannot prepare: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        return -1;
+    }
+ 
+    // Bind parameters
+    MYSQL_BIND bind_params[7];
+    memset(bind_params, 0, sizeof(bind_params));
+    
+    // NULL indicator variables - must be my_bool type
+    my_bool target_is_null = (target == NULL);
+    my_bool ip_is_null = (ip_address == NULL);
+    my_bool details_is_null = (details == NULL);
+ 
+    // client_id
+    bind_params[0].buffer_type = MYSQL_TYPE_LONG;
+    bind_params[0].buffer = &client_id;
+    bind_params[0].is_unsigned = 1; // xác định không dấu
+ 
+    // account_id
+    bind_params[1].buffer_type = MYSQL_TYPE_LONG;
+    bind_params[1].buffer = &account_id;
+ 
+    // action
+    unsigned long action_len = strlen(action);
+    bind_params[2].buffer_type = MYSQL_TYPE_STRING;
+    bind_params[2].buffer = (char *)action;
+    bind_params[2].buffer_length = action_len;
+    bind_params[2].length = &action_len;
+ 
+    // target (có thể NULL)
+    unsigned long target_len = target ? strlen(target) : 0;
+    bind_params[3].buffer_type = MYSQL_TYPE_STRING;
+    bind_params[3].buffer = (char *)target;
+    bind_params[3].buffer_length = target_len;
+    bind_params[3].length = &target_len;
+    bind_params[3].is_null = &target_is_null;
+ 
+    // status
+    unsigned long status_len = strlen(status);
+    bind_params[4].buffer_type = MYSQL_TYPE_STRING;
+    bind_params[4].buffer = (char *)status;
+    bind_params[4].buffer_length = status_len;
+    bind_params[4].length = &status_len;
+ 
+    // ip_address
+    unsigned long ip_len = ip_address ? strlen(ip_address) : 0;
+    bind_params[5].buffer_type = MYSQL_TYPE_STRING;
+    bind_params[5].buffer = (char *)ip_address;
+    bind_params[5].buffer_length = ip_len;
+    bind_params[5].length = &ip_len;
+    bind_params[5].is_null = &ip_is_null;
+ 
+    // details
+    unsigned long details_len = details ? strlen(details) : 0;
+    bind_params[6].buffer_type = MYSQL_TYPE_STRING;
+    bind_params[6].buffer = (char *)details;
+    bind_params[6].buffer_length = details_len;
+    bind_params[6].length = &details_len;
+    bind_params[6].is_null = &details_is_null;
+ 
+    if (mysql_stmt_bind_param(stmt, bind_params) != 0)
+    {
+        fprintf(stderr, "[ERROR] Cannot bind: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        return -1;
+    }
+ 
+    if (mysql_stmt_execute(stmt) != 0)
+    {
+        fprintf(stderr, "[ERROR] Cannot execute: %s\n", mysql_stmt_error(stmt));
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        return -1;
+    }
+ 
+    mysql_stmt_close(stmt);
+    pthread_mutex_unlock(&db_mutex);
+
+    return 0;
+}
+
 /* =============================================================================
    DATABASE OPERATIONS
    ============================================================================= */
@@ -290,9 +396,33 @@ int init_database()
         "INDEX idx_files_filename (filename)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
     
+    
     if (mysql_query(db, create_files_sql) != 0)
     {
         fprintf(stderr, "[ERROR] Failed to create files table: %s\n", mysql_error(db));
+        // Continue anyway, table might already exist
+    }
+
+    const char *create_activity_logs_sql = 
+        "CREATE TABLE IF NOT EXISTS activity_logs ("
+        "log_id BIGINT AUTO_INCREMENT PRIMARY KEY,"
+        "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,"
+        "client_id INT UNSIGNED NOT NULL,"
+        "account_id INT,"
+        "action VARCHAR(50) NOT NULL,"
+        "target VARCHAR(255),"
+        "status VARCHAR(20) NOT NULL,"
+        "ip_address VARCHAR(15),"
+        "details TEXT,"
+        "FOREIGN KEY (client_id) REFERENCES clients(client_id),"
+        "FOREIGN KEY (account_id) REFERENCES accounts(account_id),"
+        "INDEX idx_client_time (client_id, timestamp),"
+        "INDEX idx_action (action)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+
+    if (mysql_query(db, create_activity_logs_sql) != 0)
+    {
+        fprintf(stderr, "[ERROR] Failed to create activity_logs table: %s\n", mysql_error(db));
         // Continue anyway, table might already exist
     }
     
@@ -434,6 +564,10 @@ void handle_search(Session *session, const char *filename) {
     if (!session->is_logged_in) {
         send_response(session->socket_fd, "403\r\n"); 
         log_server("ERR", "SEARCH", session, "403");
+        // Log failed search attempt (unauthorized)
+        log_client_activity(session->client_id, -1, "SEARCH", filename, 
+                           "FORBIDDEN", inet_ntoa(session->client_addr.sin_addr), 
+                           "User not logged in");
         return;
     }
 
@@ -449,6 +583,10 @@ void handle_search(Session *session, const char *filename) {
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "SEARCH", session, "500");
+        // Log database error
+        log_client_activity(session->client_id, -1, "SEARCH", filename, 
+                           "ERROR", inet_ntoa(session->client_addr.sin_addr), 
+                           "Failed to initialize SQL statement");
         return;
     }
 
@@ -457,6 +595,10 @@ void handle_search(Session *session, const char *filename) {
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "SEARCH", session, "500");
+        // Log prepare error
+        log_client_activity(session->client_id, -1, "SEARCH", filename, 
+                           "ERROR", inet_ntoa(session->client_addr.sin_addr), 
+                           "Failed to prepare SQL statement");
         return;
     }
 
@@ -468,13 +610,27 @@ void handle_search(Session *session, const char *filename) {
     bind_param.buffer_length = filename_len;
     bind_param.length = &filename_len;
 
-    mysql_stmt_bind_param(stmt, &bind_param);
+    if (mysql_stmt_bind_param(stmt, &bind_param) != 0) {
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        log_server("ERR", "SEARCH", session, "500");
+        // Log bind error
+        log_client_activity(session->client_id, -1, "SEARCH", filename, 
+                           "ERROR", inet_ntoa(session->client_addr.sin_addr), 
+                           "Failed to bind SQL parameters");
+        return;
+    }
 
     if (mysql_stmt_execute(stmt) != 0) {
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "SEARCH", session, "500");
+        // Log execution error
+        log_client_activity(session->client_id, -1, "SEARCH", filename, 
+                           "ERROR", inet_ntoa(session->client_addr.sin_addr), 
+                           "Failed to execute SQL query");
         return;
     }
 
@@ -497,20 +653,42 @@ void handle_search(Session *session, const char *filename) {
     bind_result[2].buffer_type = MYSQL_TYPE_LONG; 
     bind_result[2].buffer = &res_port;
 
-    mysql_stmt_bind_result(stmt, bind_result);
-    mysql_stmt_store_result(stmt);
+    if (mysql_stmt_bind_result(stmt, bind_result) != 0) {
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        log_server("ERR", "SEARCH", session, "500");
+        // Log bind result error
+        log_client_activity(session->client_id, -1, "SEARCH", filename, 
+                           "ERROR", inet_ntoa(session->client_addr.sin_addr), 
+                           "Failed to bind result columns");
+        return;
+    }
+
+    if (mysql_stmt_store_result(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        send_response(session->socket_fd, "500\r\n");
+        log_server("ERR", "SEARCH", session, "500");
+        // Log store result error
+        log_client_activity(session->client_id, -1, "SEARCH", filename, 
+                           "ERROR", inet_ntoa(session->client_addr.sin_addr), 
+                           "Failed to store query result");
+        return;
+    }
 
     int file_found_in_db = mysql_stmt_num_rows(stmt);
 
     // Response Processing: Filter by active sessions and send to client
     if (file_found_in_db > 0) {
         send_response(session->socket_fd, "210\r\n");
-        log_server("OK", "SEARCH", session, "210");
-
+        
         char peer_line[256];
         int online_peers = 0;
+        int total_results = 0;
         
         while (mysql_stmt_fetch(stmt) == 0) {
+            total_results++;
             res_ip[res_ip_len] = '\0'; 
             pthread_mutex_lock(&session_mutex);
             for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -527,9 +705,22 @@ void handle_search(Session *session, const char *filename) {
         }
         send(session->socket_fd, "\r\n", 2, 0); 
         log_server("OK", "SEARCH", session, "210");
+        
+        // Log successful search with result statistics
+        char details[256];
+        snprintf(details, sizeof(details), 
+                "Search successful: Found %d total results, %d online peers", 
+                total_results, online_peers);
+        log_client_activity(session->client_id, -1, "SEARCH", filename, 
+                           "SUCCESS", inet_ntoa(session->client_addr.sin_addr), 
+                           details);
     } else {
         send_response(session->socket_fd, "404\r\n");
         log_server("OK", "SEARCH", session, "404");
+        // Log search with no results
+        log_client_activity(session->client_id, -1, "SEARCH", filename, 
+                           "NOT_FOUND", inet_ntoa(session->client_addr.sin_addr), 
+                           "No files found matching search criteria");
     }
     
     mysql_stmt_free_result(stmt);
@@ -540,11 +731,15 @@ void handle_search(Session *session, const char *filename) {
 // Handle REGISTER command from client
 void handle_register(Session *session, const char *username, const char *password)
 {
+    char *client_ip = inet_ntoa(session->client_addr.sin_addr);
+    
     // Check password length (minimum 6 characters)
     if (strlen(password) < 6)
     {
         send_response(session->socket_fd, "400\r\n");
         log_server("ERR", "REGISTER", session, "400");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "REJECTED", client_ip, "Password too short (minimum 6 characters)");
         return;
     }
     
@@ -556,6 +751,8 @@ void handle_register(Session *session, const char *username, const char *passwor
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "REGISTER", session, "500");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "ERROR", client_ip, "Failed to initialize SQL statement");
         return;
     }
     
@@ -567,16 +764,19 @@ void handle_register(Session *session, const char *username, const char *passwor
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "REGISTER", session, "500");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "ERROR", client_ip, "Failed to prepare check query");
         return;
     }
     
     // Bind username parameter
     MYSQL_BIND bind_param;
     memset(&bind_param, 0, sizeof(bind_param));
+    unsigned long username_len = strlen(username);
     bind_param.buffer_type = MYSQL_TYPE_STRING;
     bind_param.buffer = (char *)username;
-    bind_param.buffer_length = strlen(username);
-    bind_param.length = &bind_param.buffer_length;
+    bind_param.buffer_length = username_len;
+    bind_param.length = &username_len;
     
     if (mysql_stmt_bind_param(stmt, &bind_param) != 0)
     {
@@ -585,6 +785,8 @@ void handle_register(Session *session, const char *username, const char *passwor
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "REGISTER", session, "500");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "ERROR", client_ip, "Failed to bind parameters for check query");
         return;
     }
     
@@ -595,6 +797,8 @@ void handle_register(Session *session, const char *username, const char *passwor
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "REGISTER", session, "500");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "ERROR", client_ip, "Failed to execute check query");
         return;
     }
     
@@ -607,6 +811,8 @@ void handle_register(Session *session, const char *username, const char *passwor
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "400\r\n");
         log_server("ERR", "REGISTER", session, "400");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "REJECTED", client_ip, "Username already exists");
         return;
     }
     mysql_stmt_close(stmt);
@@ -621,6 +827,8 @@ void handle_register(Session *session, const char *username, const char *passwor
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "REGISTER", session, "500");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "ERROR", client_ip, "Failed to initialize insert statement");
         return;
     }
     
@@ -633,6 +841,8 @@ void handle_register(Session *session, const char *username, const char *passwor
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "REGISTER", session, "500");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "ERROR", client_ip, "Failed to prepare insert query");
         return;
     }
     
@@ -640,7 +850,7 @@ void handle_register(Session *session, const char *username, const char *passwor
     MYSQL_BIND bind_params[2];
     memset(bind_params, 0, sizeof(bind_params));
     
-    unsigned long username_len = strlen(username);
+    username_len = strlen(username);
     bind_params[0].buffer_type = MYSQL_TYPE_STRING;
     bind_params[0].buffer = (char *)username;
     bind_params[0].buffer_length = username_len;
@@ -658,6 +868,8 @@ void handle_register(Session *session, const char *username, const char *passwor
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "REGISTER", session, "500");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "ERROR", client_ip, "Failed to bind insert parameters");
         return;
     }
     
@@ -672,26 +884,35 @@ void handle_register(Session *session, const char *username, const char *passwor
             pthread_mutex_unlock(&db_mutex);
             send_response(session->socket_fd, "400\r\n");
             log_server("ERR", "REGISTER", session, "400");
+            log_client_activity(session->client_id, -1, "REGISTER", username, 
+                               "REJECTED", client_ip, "Username already exists (race condition)");
             return;
         }
         mysql_stmt_close(stmt);
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "REGISTER", session, "500");
+        log_client_activity(session->client_id, -1, "REGISTER", username, 
+                           "ERROR", client_ip, "Failed to execute insert query");
         return;
     }
     
+    // Get the inserted account_id
+    int account_id = (int)mysql_stmt_insert_id(stmt);
     mysql_stmt_close(stmt);
     pthread_mutex_unlock(&db_mutex);
     
     // Send success response
     send_response(session->socket_fd, "101\r\n");
     log_server("OK", "REGISTER", session, "101");
+    log_client_activity(session->client_id, account_id, "REGISTER", username, 
+                       "SUCCESS", client_ip, "Account created successfully");
 }
 
 // Handle LOGIN command from client
 void handle_login(Session *session, const char *username, const char *password)
 {
+    char *client_ip = inet_ntoa(session->client_addr.sin_addr);
     char password_hash[PASSWORD_HASH_LENGTH];
     hash_password(password, password_hash);
     
@@ -703,6 +924,8 @@ void handle_login(Session *session, const char *username, const char *password)
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "LOGIN", session, "500");
+        log_client_activity(session->client_id, -1, "LOGIN", username, 
+                           "ERROR", client_ip, "Failed to initialize SQL statement");
         return;
     }
     
@@ -716,6 +939,8 @@ void handle_login(Session *session, const char *username, const char *password)
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "LOGIN", session, "500");
+        log_client_activity(session->client_id, -1, "LOGIN", username, 
+                           "ERROR", client_ip, "Failed to prepare SQL query");
         return;
     }
     
@@ -736,6 +961,8 @@ void handle_login(Session *session, const char *username, const char *password)
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "LOGIN", session, "500");
+        log_client_activity(session->client_id, -1, "LOGIN", username, 
+                           "ERROR", client_ip, "Failed to bind SQL parameters");
         return;
     }
     
@@ -747,6 +974,8 @@ void handle_login(Session *session, const char *username, const char *password)
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "LOGIN", session, "500");
+        log_client_activity(session->client_id, -1, "LOGIN", username, 
+                           "ERROR", client_ip, "Failed to execute SQL query");
         return;
     }
     
@@ -780,6 +1009,8 @@ void handle_login(Session *session, const char *username, const char *password)
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "LOGIN", session, "500");
+        log_client_activity(session->client_id, -1, "LOGIN", username, 
+                           "ERROR", client_ip, "Failed to bind result columns");
         return;
     }
     
@@ -811,6 +1042,8 @@ void handle_login(Session *session, const char *username, const char *password)
             send_response(session->socket_fd, "102\r\n");
             printf("[INFO] User logged in: username=%s, account_id=%d\n", username, account_id);
             log_server("OK", "LOGIN", session, "102");
+            log_client_activity(session->client_id, account_id, "LOGIN", username, 
+                               "SUCCESS", client_ip, "Authentication successful");
             return;
         }
         else
@@ -820,6 +1053,8 @@ void handle_login(Session *session, const char *username, const char *password)
             pthread_mutex_unlock(&db_mutex);
             send_response(session->socket_fd, "401\r\n");
             log_server("ERR", "LOGIN", session, "401");
+            log_client_activity(session->client_id, account_id, "LOGIN", username, 
+                               "REJECTED", client_ip, "Incorrect password");
             return;
         }
     }
@@ -830,6 +1065,8 @@ void handle_login(Session *session, const char *username, const char *password)
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "401\r\n");
         log_server("ERR", "LOGIN", session, "401");
+        log_client_activity(session->client_id, -1, "LOGIN", username, 
+                           "REJECTED", client_ip, "Username not found");
         return;
     }
     else
@@ -840,6 +1077,8 @@ void handle_login(Session *session, const char *username, const char *password)
         pthread_mutex_unlock(&db_mutex);
         send_response(session->socket_fd, "500\r\n");
         log_server("ERR", "LOGIN", session, "500");
+        log_client_activity(session->client_id, -1, "LOGIN", username, 
+                           "ERROR", client_ip, "SQL fetch error");
         return;
     }
 }
@@ -848,11 +1087,14 @@ void handle_login(Session *session, const char *username, const char *password)
 void handle_publish(Session *session, const char *filename)
 {
     char query[BUFF_SIZE];
+    char *client_ip = inet_ntoa(session->client_addr.sin_addr);
 
     // Authorization check
     if (!session->is_logged_in) {
         send_response(session->socket_fd, "403\r\n"); // Not logged in
         log_server("ERR", "PUBLISH", session, "403");
+        log_client_activity(session->client_id, session->account_id, "PUBLISH", filename, 
+                           "FORBIDDEN", client_ip, "User not logged in");
         return;
     }
 
@@ -860,6 +1102,8 @@ void handle_publish(Session *session, const char *filename)
     if (strlen(filename) == 0 || strlen(filename) > 255) {
         send_response(session->socket_fd, "402\r\n"); // Invalid filename
         log_server("ERR", "PUBLISH", session, "402");
+        log_client_activity(session->client_id, session->account_id, "PUBLISH", filename, 
+                           "REJECTED", client_ip, "Invalid filename length");
         return;
     }
 
@@ -875,6 +1119,8 @@ void handle_publish(Session *session, const char *filename)
     {
         send_response(session->socket_fd, "500\r\n"); // Server error
         log_server("ERR", "PUBLISH", session, "500");
+        log_client_activity(session->client_id, session->account_id, "PUBLISH", filename, 
+                           "ERROR", client_ip, "Failed to connect to database");
         return;
     }
 
@@ -887,13 +1133,31 @@ void handle_publish(Session *session, const char *filename)
     );
 
     if (mysql_query(conn, query)) {
-        fprintf(stderr, "[DB-ERR] Publish failed: %s\n", mysql_error(conn));
-        send_response(session->socket_fd, "500\r\n"); // Server error
-        log_server("ERR", "PUBLISH", session, "500");
+        unsigned int err_no = mysql_errno(conn);
+        char error_details[256];
+        
+        if (err_no == 1062) { // Duplicate entry
+            snprintf(error_details, sizeof(error_details), 
+                    "File already published: %s", mysql_error(conn));
+            send_response(session->socket_fd, "409\r\n"); // Conflict
+            log_server("ERR", "PUBLISH", session, "409");
+            log_client_activity(session->client_id, session->account_id, "PUBLISH", filename, 
+                               "REJECTED", client_ip, error_details);
+        } else {
+            fprintf(stderr, "[DB-ERR] Publish failed: %s\n", mysql_error(conn));
+            send_response(session->socket_fd, "500\r\n"); // Server error
+            log_server("ERR", "PUBLISH", session, "500");
+            snprintf(error_details, sizeof(error_details), 
+                    "Database error: %s", mysql_error(conn));
+            log_client_activity(session->client_id, session->account_id, "PUBLISH", filename, 
+                               "ERROR", client_ip, error_details);
+        }
     } else {
         send_response(session->socket_fd, "201\r\n"); // Publish successful
         log_server("OK", "PUBLISH", session, "201");
         printf("[INFO] File published: %s by client %u\n", filename, session->client_id);
+        log_client_activity(session->client_id, session->account_id, "PUBLISH", filename, 
+                           "SUCCESS", client_ip, "File published successfully");
     }
 
     mysql_close(conn);
@@ -902,16 +1166,21 @@ void handle_publish(Session *session, const char *filename)
 // Handle UNPUBLISH command from client
 void handle_unpublish(Session *session, const char *filename) {
     char query[BUFF_SIZE];
+    char *client_ip = inet_ntoa(session->client_addr.sin_addr);
 
     if (!session->is_logged_in) {
         send_all(session->socket_fd, "403\r\n", 5); 
         log_server("ERR", "UNPUBLISH", session, "403");
+        log_client_activity(session->client_id, session->account_id, "UNPUBLISH", filename, 
+                           "FORBIDDEN", client_ip, "User not logged in");
         return;
     }
 
     if (strlen(filename) == 0) {
         send_all(session->socket_fd, "402\r\n", 5);
         log_server("ERR", "UNPUBLISH", session, "402");
+        log_client_activity(session->client_id, session->account_id, "UNPUBLISH", filename, 
+                           "REJECTED", client_ip, "Empty filename");
         return;
     }
 
@@ -919,6 +1188,8 @@ void handle_unpublish(Session *session, const char *filename) {
     if (!conn) {
         send_response(session->socket_fd, "500\r\n"); 
         log_server("ERR", "UNPUBLISH", session, "500");
+        log_client_activity(session->client_id, session->account_id, "UNPUBLISH", filename, 
+                           "ERROR", client_ip, "Failed to initialize database connection");
         return;
     }
 
@@ -934,6 +1205,8 @@ void handle_unpublish(Session *session, const char *filename) {
         send_response(session->socket_fd, "500\r\n"); 
         log_server("ERR", "UNPUBLISH", session, "500"); 
         mysql_close(conn);
+        log_client_activity(session->client_id, session->account_id, "UNPUBLISH", filename, 
+                           "ERROR", client_ip, "Failed to connect to database");
         return;
     }
 
@@ -945,14 +1218,24 @@ void handle_unpublish(Session *session, const char *filename) {
         fprintf(stderr, "[DB-ERR] Unpublish failed: %s\n", mysql_error(conn));
         send_all(session->socket_fd, "500\r\n", 5); 
         log_server("ERR", "UNPUBLISH", session, "500");
+        char error_details[256];
+        snprintf(error_details, sizeof(error_details), 
+                "Database error: %s", mysql_error(conn));
+        log_client_activity(session->client_id, session->account_id, "UNPUBLISH", filename, 
+                           "ERROR", client_ip, error_details);
     } else {
-        if (mysql_affected_rows(conn) > 0) {
+        int affected_rows = mysql_affected_rows(conn);
+        if (affected_rows > 0) {
             printf("[SERVER] Client %u unpublished file: %s\n", session->client_id, filename);
             send_all(session->socket_fd, "202\r\n", 5); 
             log_server("OK", "UNPUBLISH", session, "202");
+            log_client_activity(session->client_id, session->account_id, "UNPUBLISH", filename, 
+                               "SUCCESS", client_ip, "File unpublished successfully");
         } else {
             send_all(session->socket_fd, "404\r\n", 5); 
             log_server("ERR", "UNPUBLISH", session, "404");
+            log_client_activity(session->client_id, session->account_id, "UNPUBLISH", filename, 
+                               "NOT_FOUND", client_ip, "File not found for this client");
         }
     }
     mysql_close(conn);
@@ -962,26 +1245,37 @@ void handle_unpublish(Session *session, const char *filename) {
 // Command format: LOGOUT
 void handle_logout(Session *session)
 {
+    char *client_ip = inet_ntoa(session->client_addr.sin_addr);
+    
     // Check if already logged out
     if (!session->is_logged_in) {
         const char *err = "403\r\n"; // Not logged in
         log_server("ERR", "LOGOUT", session, "403");
         send(session->socket_fd, err, strlen(err), 0);
+        log_client_activity(session->client_id, -1, "LOGOUT", NULL, 
+                           "REJECTED", client_ip, "User not logged in");
         return;
     }
 
-    // Log the logout action
+    // Get username before resetting session
+    char username[256];
+    strncpy(username, session->username, sizeof(username) - 1);
+    username[sizeof(username) - 1] = '\0';
+    int account_id = session->account_id;
+
+    // Log the logout action before resetting session
+    log_client_activity(session->client_id, account_id, "LOGOUT", username, 
+                       "SUCCESS", client_ip, "User logged out");
+
+    // Send success response
+    const char *ok = "104\r\n"; // Logout successful
+    send(session->socket_fd, ok, strlen(ok), 0);
     log_server("OK", "LOGOUT", session, "104");
 
     // Reset session state
     session->is_logged_in = 0;
     session->account_id  = -1;
-    session->client_id   = 0;
     memset(session->username, 0, sizeof(session->username));
-
-    // Send success response
-    const char *ok = "104\r\n"; // Logout successful
-    send(session->socket_fd, ok, strlen(ok), 0);
 
     printf("[INFO] Client logged out successfully\n");
 }
